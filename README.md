@@ -84,8 +84,6 @@ A safe example configuration file is included in this repository:
 PushoverWatchdog.example.json
 ```
 
-Do **not** publish or commit your real `plugins_configs/PushoverWatchdog.json` if it contains private Pushover credentials.
-
 ---
 
 ## Pushover Setup
@@ -417,9 +415,6 @@ Unauthenticated users cannot:
 - Save configuration changes
 - Send test notifications
 
-Do not publish your real Pushover credentials.
-
-Use an example configuration file when sharing the plugin publicly.
 
 ---
 
