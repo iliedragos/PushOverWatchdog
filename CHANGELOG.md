@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-05-26 - Signal conversion offset fix
+
+- Updated dBf to dBµV conversion offset from `10.875` to `11.25`, matching TEF firmware and FM-DX Webserver.
+- Updated dBf to dBm conversion offset from `119.75` to `120`, matching TEF firmware and FM-DX Webserver.
+- Updated the admin interface help text for signal-unit monitoring to reflect the corrected conversion offsets.
+
 ## v1.0.0
 
 Current public release by Play Radio Constanta.
