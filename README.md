@@ -78,12 +78,6 @@ The plugin creates and reads this configuration file:
 plugins_configs/PushoverWatchdog.json
 ```
 
-A safe example configuration file is included in this repository:
-
-```text
-PushoverWatchdog.example.json
-```
-
 ---
 
 ## Pushover Setup
