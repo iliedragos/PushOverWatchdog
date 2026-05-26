@@ -1,7 +1,5 @@
 # Security
 
-Do not commit real Pushover credentials.
-
 The runtime configuration file is intentionally ignored by `.gitignore`:
 
 ```text
