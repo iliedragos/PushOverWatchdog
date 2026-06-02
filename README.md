@@ -20,6 +20,7 @@ The plugin is designed for FM monitoring setups using TEF / Headless TEF receive
 - Configurable force-retune interval
 - Hot-reload configuration support
 - Login-protected configuration panel
+- RadioText log with rolling retention: the most recent 7 days only
 - Emergency priority support for Pushover notifications
 
 ---
