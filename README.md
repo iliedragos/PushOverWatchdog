@@ -16,12 +16,12 @@ The plugin is designed for FM monitoring setups using TEF / Headless TEF receive
 - Stereo indicator instability detection
 - Recovery notifications
 - Pushover, Telegram & Zabbix alert integration
+- Emergency priority support for Pushover notifications
 - Configurable monitored frequency or frequency list
 - Configurable force-retune interval
 - Hot-reload configuration support
 - Login-protected configuration panel
 - RadioText log with rolling retention: the most recent 7 days only
-- Emergency priority support for Pushover notifications
 
 ---
 
