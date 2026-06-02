@@ -46,12 +46,16 @@
   }
 
   const pluginName = 'Pushover Watchdog';
-  const pluginVersion = '1.0.0';
+  const pluginVersion = '1.0.1';
   const pluginAuthor = 'by Play Radio Constanta';
   let config = null;
   let status = null;
   let ws = null;
   let wsReconnectTimer = null;
+  let rtLogEntries = [];
+  let rtLogHasMore = false;
+  let rtLogBefore = null;
+  let rtLogAppendNext = false;
 
   function wsUrl() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -94,6 +98,14 @@
       if (msg.type === 'PushoverWatchdog:status') {
         status = msg.value;
         renderStatus();
+      }
+      if (msg.type === 'PushoverWatchdog:rtLogPage') {
+        applyRtLogPage(msg.value || {});
+      }
+      if (msg.type === 'PushoverWatchdog:rtLogChanged') {
+        if (document.getElementById('pushover-watchdog-rtlog-modal') && !document.getElementById('pushover-watchdog-rtlog-modal').classList.contains('hidden')) {
+          requestRtLog(true);
+        }
       }
       if (msg.type === 'PushoverWatchdog:toast') {
         toast(msg.value?.level || 'info', msg.value?.message || 'Pushover Watchdog update');
@@ -145,6 +157,41 @@
       </label>`;
   }
 
+  function receiverToggleSelect(id, label, value, help = '') {
+    const selected = ['enabled', 'disabled'].includes(String(value)) ? String(value) : 'keep';
+    return `
+      <label class="pwd-field">
+        <span>${label}</span>
+        <select id="${id}">
+          <option value="keep" ${selected === 'keep' ? 'selected' : ''}>Keep current setting</option>
+          <option value="enabled" ${selected === 'enabled' ? 'selected' : ''}>Enabled</option>
+          <option value="disabled" ${selected === 'disabled' ? 'selected' : ''}>Disabled</option>
+        </select>
+        ${help ? `<small>${help}</small>` : ''}
+      </label>`;
+  }
+
+  function bandwidthSelect(value) {
+    const selected = String(value ?? 'keep');
+    const bandwidths = [
+      ['keep', 'Keep current setting'],
+      ['0', 'Auto'],
+      ['56000', '56 kHz'], ['64000', '64 kHz'], ['72000', '72 kHz'],
+      ['84000', '84 kHz'], ['97000', '97 kHz'], ['114000', '114 kHz'],
+      ['133000', '133 kHz'], ['151000', '151 kHz'], ['184000', '184 kHz'],
+      ['200000', '200 kHz'], ['217000', '217 kHz'], ['236000', '236 kHz'],
+      ['254000', '254 kHz'], ['287000', '287 kHz'], ['311000', '311 kHz']
+    ];
+    return `
+      <label class="pwd-field">
+        <span>Bandwidth after watchdog tune / retune</span>
+        <select id="pwd-force-bw">
+          ${bandwidths.map(([key, label]) => `<option value="${key}" ${selected === key ? 'selected' : ''}>${label}</option>`).join('')}
+        </select>
+        <small>FM-DX TEF values. Auto sends W0; selecting “Keep” sends no bandwidth command.</small>
+      </label>`;
+  }
+
 
   function normalizeSignalUnit(unit) {
     const u = String(unit || '').trim().toLowerCase();
@@ -188,21 +235,30 @@
       <div class="pwd-card">
         <div class="pwd-header">
           <div>
-            <h2>${pluginName}</h2>
-            <div class="pwd-subtitle">v${pluginVersion} · ${pluginAuthor} · blank / dBµV signal threshold / RDS / stereo indicator alerts via Pushover</div>
+            <h2>FM Monitor</h2>
+            <div class="pwd-subtitle">Pushover Watchdog v${pluginVersion} · ${pluginAuthor} · signal / modulation / RDS / stereo monitoring</div>
           </div>
-          <button id="pwd-close" class="pwd-icon-btn">×</button>
+          <button id="pwd-close" class="pwd-icon-btn" aria-label="Close">×</button>
         </div>
 
         <div id="pwd-live-status" class="pwd-status"></div>
 
         <div class="pwd-grid">
-          ${checkbox('pwd-enabled', 'Enable watchdog', config.enabled)}
+          ${checkbox('pwd-enabled', 'Enable monitoring and alerts', config.enabled)}
           ${checkbox('pwd-recovery', 'Send recovery notifications', config.sendRecoveryNotifications)}
           ${checkbox('pwd-rds', 'Include RDS info in notifications', config.includeRdsInfo)}
+          ${checkbox('pwd-rtlog-enabled', 'Enable RadioText logging (fully loaded RT only / rolling 7 days)', config.radioTextLoggingEnabled)}
           ${checkbox('pwd-require-carrier', 'Blank detection requires carrier present', config.requireCarrierForBlank)}
           ${checkbox('pwd-require-carrier-rds', 'RDS missing detection requires carrier present', config.requireCarrierForRds)}
           ${checkbox('pwd-stereo-enabled', 'Enable stereo indicator monitoring', config.stereoMonitorEnabled)}
+        </div>
+
+        <h3>Notification channels</h3>
+        <div class="pwd-subtitle">Save settings before sending a test notification for a channel.</div>
+        <div class="pwd-grid">
+          ${checkbox('pwd-pushover-enabled', 'Enable Pushover notifications', config.pushoverEnabled)}
+          ${checkbox('pwd-telegram-enabled', 'Enable Telegram notifications', config.telegramEnabled)}
+          ${checkbox('pwd-zabbix-enabled', 'Enable Zabbix sender notifications', config.zabbixEnabled)}
         </div>
 
         <h3>Pushover</h3>
@@ -215,6 +271,24 @@
           ${field('pwd-retry', 'Emergency retry seconds', config.pushoverRetrySeconds ?? 60, 'number', 'Only used when Priority is 2. Minimum accepted by Pushover: 30 seconds.')}
           ${field('pwd-expire', 'Emergency expire seconds', config.pushoverExpireSeconds ?? 1800, 'number', 'Only used when Priority is 2. Example: 1800 = repeat for 30 minutes.')}
         </div>
+        <div class="pwd-inline-actions"><button id="pwd-test-pushover" class="pwd-secondary">Test Pushover</button></div>
+
+        <h3>Telegram Bot</h3>
+        <div class="pwd-grid">
+          ${field('pwd-telegram-token', 'Bot token', config.telegramBotToken, 'password', 'Create the bot with BotFather and provide its HTTP API token.')}
+          ${field('pwd-telegram-chat', 'Chat ID', config.telegramChatId, 'text', 'User, group or channel chat ID where alerts will be sent.')}
+          ${field('pwd-telegram-thread', 'Topic / message thread ID (optional)', config.telegramThreadId, 'text', 'Use only for a Telegram forum topic.')}
+        </div>
+        <div class="pwd-inline-actions"><button id="pwd-test-telegram" class="pwd-secondary">Test Telegram</button></div>
+
+        <h3>Zabbix sender / trapper</h3>
+        <div class="pwd-grid">
+          ${field('pwd-zabbix-server', 'Zabbix server or proxy', config.zabbixServer, 'text', 'A reachable Zabbix server/proxy accepting sender data.')}
+          ${field('pwd-zabbix-port', 'Port', config.zabbixPort ?? 10051, 'number', 'Default trapper port: 10051.')}
+          ${field('pwd-zabbix-host', 'Configured Zabbix host name', config.zabbixHost, 'text', 'Must exactly match the Host name in Zabbix.')}
+          ${field('pwd-zabbix-key', 'Trapper item key', config.zabbixKey, 'text', 'Create this key as a Zabbix trapper item; received value is a JSON alert event.')}
+        </div>
+        <div class="pwd-inline-actions"><button id="pwd-test-zabbix" class="pwd-secondary">Test Zabbix</button></div>
 
         <h3>Frequencies and timing</h3>
         <label class="pwd-field pwd-wide">
@@ -226,16 +300,23 @@
           ${field('pwd-interval', 'Check interval seconds', config.checkIntervalSeconds, 'number')}
           ${field('pwd-settle', 'Tune settle seconds', config.tuneSettleSeconds, 'number')}
           ${field('pwd-dwell', 'Dwell seconds per frequency', config.dwellSeconds, 'number')}
-          ${field('pwd-force-retune', 'Force retune interval seconds', config.forceRetuneSeconds, 'number', '0 disables it. If the receiver is left on another frequency, the plugin tunes back to the active monitored frequency after this interval.')}
+          ${field('pwd-force-retune', 'Force retune grace seconds', config.forceRetuneSeconds, 'number', '0 disables forced return. Otherwise the receiver is tuned back after remaining off target for this duration.')}
           ${field('pwd-cooldown', 'Alert cooldown minutes', config.alertCooldownMinutes, 'number')}
+        </div>
+
+        <h3>Receiver options applied after watchdog tune / retune</h3>
+        <div class="pwd-grid">
+          ${bandwidthSelect(config.forceRetuneBandwidthHz)}
+          ${receiverToggleSelect('pwd-force-ceq', 'cEQ after watchdog tune / retune', config.forceRetuneCeq, 'FM-DX sends the combined G command for cEQ and iMS.')}
+          ${receiverToggleSelect('pwd-force-ims', 'iMS after watchdog tune / retune', config.forceRetuneIms, 'Keep leaves the current receiver value unchanged.')}
         </div>
 
         <h3>Thresholds</h3>
         <div class="pwd-grid">
           ${selectSignalUnit(config.signalUnit)}
-          ${field('pwd-signal-threshold', `Minimum expected RF signal (${signalUnitLabel(config.signalUnit)})`, config.signalThreshold, 'number', 'Set this relative to the normal signal level of the monitored station. Below this value triggers signal-below-threshold / white-noise detection. For dBµV and dBm, the plugin converts FM-DX raw dBf using the same offsets as TEF firmware and FM-DX Webserver.')}
+          ${field('pwd-signal-threshold', `Minimum expected RF signal (${signalUnitLabel(config.signalUnit)})`, config.signalThreshold, 'number', 'Set this relative to the normal signal level of the monitored station. Below this value triggers signal-below-threshold / white-noise detection.')}
           ${field('pwd-no-carrier-seconds', 'Signal-below-threshold duration seconds', config.noCarrierSeconds, 'number')}
-          ${field('pwd-rds-missing-seconds', 'RDS missing duration seconds', config.rdsMissingSeconds, 'number', 'Alert when no valid RDS identity (PI or PS) is decoded for this long while monitoring the target frequency. Raw RDS lock is shown only as diagnostic information.')}
+          ${field('pwd-rds-missing-seconds', 'RDS missing duration seconds', config.rdsMissingSeconds, 'number', 'Alert when no valid RDS identity (PI or PS) is decoded for this long while monitoring the target frequency.')}
           ${field('pwd-blank-dbfs', 'Blank audio threshold dBFS', config.audioSilenceThresholdDbfs, 'number', 'Typical start: -45 dBFS. More negative = less sensitive.')}
           ${field('pwd-blank-seconds', 'Blank duration seconds', config.blankSeconds, 'number')}
           ${field('pwd-recovery-seconds', 'Recovery confirmation seconds', config.recoverySeconds, 'number')}
@@ -243,30 +324,36 @@
 
         <h3>Stereo indicator instability</h3>
         <div class="pwd-grid">
-          ${field('pwd-stereo-window', 'Stereo analysis window seconds', config.stereoWindowSeconds ?? 60, 'number', 'Uses the normal check interval. Example: at 2 seconds, a 60-second window keeps about 30 samples.')}
-          ${field('pwd-stereo-min-drops', 'Minimum stereo drops in window', config.stereoMinDrops ?? 3, 'number', 'Counts yes → no transitions of the webserver stereo indicator.')}
-          ${field('pwd-stereo-min-off', 'Minimum off samples in window', config.stereoMinOffSamples ?? 2, 'number', 'Also alerts if the stereo indicator is caught as off this many times inside the window.')}
-          ${field('pwd-stereo-recovery', 'Stereo recovery confirmation seconds', config.stereoRecoverySeconds ?? 30, 'number', 'How long stereo must remain stable/on before a recovery notification is sent.')}
+          ${field('pwd-stereo-window', 'Stereo analysis window seconds', config.stereoWindowSeconds ?? 60, 'number')}
+          ${field('pwd-stereo-min-drops', 'Minimum stereo drops in window', config.stereoMinDrops ?? 3, 'number')}
+          ${field('pwd-stereo-min-off', 'Minimum off samples in window', config.stereoMinOffSamples ?? 2, 'number')}
+          ${field('pwd-stereo-recovery', 'Stereo recovery confirmation seconds', config.stereoRecoverySeconds ?? 30, 'number')}
           ${checkbox('pwd-stereo-require-carrier', 'Stereo monitoring requires carrier/signal above threshold', config.stereoRequireCarrier)}
           ${checkbox('pwd-stereo-require-audio', 'Stereo monitoring requires audio/modulation present', config.stereoRequireAudio)}
           ${checkbox('pwd-stereo-require-rds', 'Stereo monitoring requires valid RDS identity', config.stereoRequireRdsValid)}
         </div>
 
         <div class="pwd-actions">
-          <button id="pwd-test" class="pwd-secondary">Send test</button>
+          <button id="pwd-open-rtlog" class="pwd-secondary"><i class="fa-solid fa-scroll"></i>&nbsp; RadioText log</button>
           <button id="pwd-save" class="pwd-primary">Save settings</button>
         </div>
       </div>`;
 
     document.getElementById('pwd-close').onclick = closeModal;
     document.getElementById('pwd-save').onclick = saveFromUi;
-    document.getElementById('pwd-test').onclick = () => {
-      if (!isAuthenticated()) {
-        toast('error', 'You must be logged in to send test notifications.');
-        return;
+    document.getElementById('pwd-open-rtlog').onclick = openRtLogModal;
+    ['pushover', 'telegram', 'zabbix'].forEach(channel => {
+      const button = document.getElementById(`pwd-test-${channel}`);
+      if (button) {
+        button.onclick = () => {
+          if (!isAuthenticated()) {
+            toast('error', 'You must be logged in to send test notifications.');
+            return;
+          }
+          send('PushoverWatchdog:testChannel', { channel });
+        };
       }
-      send('PushoverWatchdog:test', {});
-    };
+    });
     renderStatus();
   }
 
@@ -278,11 +365,10 @@
       <b>Target:</b> ${escapeHtml(status.activeFrequency || '-')} MHz ·
       <b>Current:</b> ${escapeHtml(status.currentFrequency || '-')} MHz ·
       <b>Signal:</b> ${Number.isFinite(status.signal) ? status.signal.toFixed(1) + ' ' + escapeHtml(status.signalUnitLabel || '') : '-'}${Number.isFinite(status.signalRawDbf) && status.signalUnit !== 'dbf' ? ' (raw ' + status.signalRawDbf.toFixed(1) + ' dBf)' : ''} ·
-      <b>RDS lock:</b> ${status.rdsPresent ? 'yes' : '?'} ·
       <b>RDS valid:</b> ${status.rdsValid ? 'yes' : 'no'} ·
       <b>Stereo:</b> ${status.stereo ? 'yes' : 'no'} ·
       <b>Audio:</b> ${status.audioDbfs === null ? 'n/a' : status.audioDbfs + ' dBFS'} ·
-      <b>Audio monitor:</b> ${status.audioAttached ? 'attached' : 'not attached'}`;
+      <b>RT log:</b> ${status.radioTextLoggingEnabled ? escapeHtml(String(status.radioTextLogCount || 0)) + ' entries / 7 days' : 'disabled'}`;
   }
 
   function readNum(id, fallback) {
@@ -300,6 +386,7 @@
 
     const next = {
       enabled: document.getElementById('pwd-enabled').checked,
+      pushoverEnabled: document.getElementById('pwd-pushover-enabled').checked,
       pushoverUserKey: document.getElementById('pwd-user').value.trim(),
       pushoverApiToken: document.getElementById('pwd-token').value.trim(),
       pushoverDevice: document.getElementById('pwd-device').value.trim(),
@@ -307,11 +394,24 @@
       pushoverPriority: readNum('pwd-priority', 0),
       pushoverRetrySeconds: readNum('pwd-retry', 60),
       pushoverExpireSeconds: readNum('pwd-expire', 1800),
+      telegramEnabled: document.getElementById('pwd-telegram-enabled').checked,
+      telegramBotToken: document.getElementById('pwd-telegram-token').value.trim(),
+      telegramChatId: document.getElementById('pwd-telegram-chat').value.trim(),
+      telegramThreadId: document.getElementById('pwd-telegram-thread').value.trim(),
+      zabbixEnabled: document.getElementById('pwd-zabbix-enabled').checked,
+      zabbixServer: document.getElementById('pwd-zabbix-server').value.trim(),
+      zabbixPort: readNum('pwd-zabbix-port', 10051),
+      zabbixHost: document.getElementById('pwd-zabbix-host').value.trim(),
+      zabbixKey: document.getElementById('pwd-zabbix-key').value.trim(),
+      radioTextLoggingEnabled: document.getElementById('pwd-rtlog-enabled').checked,
       frequencies,
       checkIntervalSeconds: readNum('pwd-interval', 2),
       tuneSettleSeconds: readNum('pwd-settle', 4),
       dwellSeconds: readNum('pwd-dwell', 30),
       forceRetuneSeconds: readNum('pwd-force-retune', 10),
+      forceRetuneBandwidthHz: document.getElementById('pwd-force-bw').value,
+      forceRetuneCeq: document.getElementById('pwd-force-ceq').value,
+      forceRetuneIms: document.getElementById('pwd-force-ims').value,
       signalUnit: normalizeSignalUnit(document.getElementById('pwd-signal-unit').value),
       signalThreshold: readNum('pwd-signal-threshold', 20),
       noCarrierSeconds: readNum('pwd-no-carrier-seconds', 20),
@@ -335,6 +435,93 @@
       debugLogging: false
     };
     send('PushoverWatchdog:saveConfig', next);
+  }
+
+  function ensureRtLogModal() {
+    let modal = document.getElementById('pushover-watchdog-rtlog-modal');
+    if (!modal) {
+      modal = document.createElement('div');
+      modal.id = 'pushover-watchdog-rtlog-modal';
+      modal.className = 'pwd-modal hidden';
+      document.body.appendChild(modal);
+    }
+    modal.innerHTML = `
+      <div class="pwd-card pwd-rtlog-card">
+        <div class="pwd-header">
+          <div>
+            <h2><i class="fa-solid fa-scroll"></i>&nbsp; RadioText log</h2>
+            <div class="pwd-subtitle">Rolling retention: the most recent 7 days only. Each settled RadioText A/B sequence is stored only when its text changes.</div>
+          </div>
+          <button id="pwd-rtlog-close" class="pwd-icon-btn" aria-label="Close">×</button>
+        </div>
+        <div class="pwd-inline-actions pwd-rtlog-actions">
+          <button id="pwd-rtlog-refresh" class="pwd-secondary">Refresh</button>
+          <button id="pwd-rtlog-older" class="pwd-secondary" ${rtLogHasMore ? '' : 'disabled'}>Load older</button>
+        </div>
+        <div class="pwd-rtlog-table-wrap">
+          <table class="pwd-rtlog-table">
+            <thead><tr><th>Date / time</th><th>Frequency</th><th>PI</th><th>PS</th><th>RadioText</th></tr></thead>
+            <tbody>${renderRtLogRows()}</tbody>
+          </table>
+        </div>
+        <div class="pwd-subtitle">${rtLogEntries.length ? `${rtLogEntries.length} displayed entr${rtLogEntries.length === 1 ? 'y' : 'ies'}.` : 'No RadioText has been recorded in the retained interval.'}</div>
+      </div>`;
+    document.getElementById('pwd-rtlog-close').onclick = closeRtLogModal;
+    document.getElementById('pwd-rtlog-refresh').onclick = () => requestRtLog(true);
+    document.getElementById('pwd-rtlog-older').onclick = () => requestRtLog(false);
+    return modal;
+  }
+
+  function renderRtLogRows() {
+    if (!rtLogEntries.length) return '<tr><td colspan="5" class="pwd-empty">No RadioText log entries.</td></tr>';
+    return rtLogEntries.map(entry => {
+      const localTime = entry.timestamp ? new Date(entry.timestamp).toLocaleString() : '-';
+      return `<tr>
+        <td>${escapeHtml(localTime)}</td>
+        <td>${escapeHtml(entry.frequency || '-')} MHz</td>
+        <td>${escapeHtml(entry.pi || '-')}</td>
+        <td>${escapeHtml(entry.ps || '-')}</td>
+        <td class="pwd-rt-text">${escapeHtml(entry.rt || '-')}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  function requestRtLog(reset) {
+    if (!isAuthenticated()) return;
+    if (reset) {
+      rtLogEntries = [];
+      rtLogBefore = null;
+    }
+    rtLogAppendNext = !reset;
+    send('PushoverWatchdog:getRtLog', {
+      before: reset ? null : rtLogBefore,
+      limit: 100
+    });
+  }
+
+  function applyRtLogPage(page) {
+    const entries = Array.isArray(page.entries) ? page.entries : [];
+    rtLogEntries = rtLogAppendNext ? rtLogEntries.concat(entries) : entries;
+    rtLogAppendNext = false;
+    rtLogHasMore = !!page.hasMore;
+    rtLogBefore = page.nextBefore || null;
+    const modal = ensureRtLogModal();
+    if (!modal.classList.contains('hidden')) modal.classList.remove('hidden');
+  }
+
+  function openRtLogModal() {
+    if (!isAuthenticated()) {
+      toast('error', 'You must be logged in to view the RadioText log.');
+      return;
+    }
+    const modal = ensureRtLogModal();
+    modal.classList.remove('hidden');
+    requestRtLog(true);
+  }
+
+  function closeRtLogModal() {
+    const modal = document.getElementById('pushover-watchdog-rtlog-modal');
+    if (modal) modal.classList.add('hidden');
   }
 
   function openModal() {
@@ -382,65 +569,79 @@
       .pwd-check{display:flex;align-items:center;gap:8px;background:var(--color-2-transparent,rgba(255,255,255,.06));border-radius:8px;padding:8px;font-size:13px;}
       .pwd-card h3{margin:18px 0 10px;font-size:15px;color:var(--color-4,#7ab7ff);}
       .pwd-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:18px;}
+      .pwd-inline-actions{display:flex;justify-content:flex-end;gap:10px;margin:4px 0 14px;}
       .pwd-primary,.pwd-secondary{border:0;border-radius:10px;padding:10px 14px;cursor:pointer;font-weight:600;}
       .pwd-primary{background:var(--color-4,#7ab7ff);color:#000;}
       .pwd-secondary{background:var(--color-2,#333);color:var(--color-main-bright,#fff);}
-      @media(max-width:720px){.pwd-grid{grid-template-columns:1fr}.pwd-actions{flex-direction:column}.pwd-primary,.pwd-secondary{width:100%;}}
+      .pwd-secondary:disabled{opacity:.5;cursor:not-allowed;}
+      .pwd-rtlog-card{width:min(1120px,96vw);}
+      .pwd-rtlog-actions{justify-content:flex-start;}
+      .pwd-rtlog-table-wrap{overflow:auto;max-height:65vh;border:1px solid var(--color-2,#333);border-radius:10px;margin-bottom:10px;}
+      .pwd-rtlog-table{width:100%;border-collapse:collapse;font-size:13px;}
+      .pwd-rtlog-table th,.pwd-rtlog-table td{padding:9px;border-bottom:1px solid var(--color-2,#333);text-align:left;vertical-align:top;}
+      .pwd-rtlog-table th{position:sticky;top:0;background:var(--color-1,#161616);color:var(--color-4,#7ab7ff);}
+      .pwd-rt-text{min-width:300px;white-space:pre-wrap;word-break:break-word;}
+      .pwd-empty{text-align:center!important;opacity:.7;padding:28px!important;}
+      @media(max-width:720px){.pwd-grid{grid-template-columns:1fr}.pwd-actions{flex-direction:column}.pwd-primary,.pwd-secondary{width:100%;}.pwd-rt-text{min-width:220px;}}
     `;
     document.head.appendChild(style);
   }
 
-  function addButton() {
-    if (!isAuthenticated()) {
-      const existing = document.getElementById('pushover-watchdog-button');
+  function removeButtons() {
+    ['pushover-watchdog-button', 'pushover-watchdog-rtlog-button'].forEach(id => {
+      const existing = document.getElementById(id);
       if (existing) existing.remove();
+    });
+  }
+
+  function addPanelButton(id, label, icon, tooltip, onClick) {
+    const attachClick = () => {
+      const btn = document.getElementById(id);
+      if (btn && !btn.__pwdClickAttached) {
+        btn.__pwdClickAttached = true;
+        btn.addEventListener('click', onClick);
+      }
+    };
+
+    if (document.getElementById(id)) {
+      attachClick();
+      return;
+    }
+    if (typeof addIconToPluginPanel === 'function') {
+      addIconToPluginPanel(id, label, 'solid', icon, tooltip);
+      attachClick();
       return;
     }
 
-    const attachClick = () => {
-      const btn = document.getElementById('pushover-watchdog-button');
-      if (btn && !btn.__pushoverWatchdogClickAttached) {
-        btn.__pushoverWatchdogClickAttached = true;
-        btn.addEventListener('click', openModal);
-      }
-    };
+    const container = document.querySelector('.scrollable-container');
+    if (!container) return;
+    const btn = document.createElement('button');
+    btn.className = 'no-bg color-4 hover-brighten tooltip';
+    btn.id = id;
+    btn.style.cssText = 'padding: 6px; width: 64px; min-width: 64px;';
+    btn.setAttribute('data-tooltip', tooltip);
+    btn.setAttribute('data-tooltip-placement', 'bottom');
+    btn.innerHTML = `<i class="fa-solid fa-${icon} fa-lg top-10"></i><br><span style="font-size: 10px; color: var(--color-main-bright) !important;">${label}</span>`;
+    container.appendChild(btn);
+    if (typeof initTooltips === 'function') initTooltips($(btn));
+    if (typeof checkScroll === 'function') runtimeSetTimeout(checkScroll, 100);
+    attachClick();
+  }
 
-    const fallbackButtonCreate = () => {
-      if (document.getElementById('pushover-watchdog-button')) { attachClick(); return; }
-      const container = document.querySelector('.scrollable-container');
-      if (!container) return;
-      const btn = document.createElement('button');
-      btn.className = 'no-bg color-4 hover-brighten tooltip';
-      btn.id = 'pushover-watchdog-button';
-      btn.style.cssText = 'padding: 6px; width: 64px; min-width: 64px;';
-      btn.setAttribute('data-tooltip', 'FM Monitor');
-      btn.setAttribute('data-tooltip-placement', 'bottom');
-      btn.innerHTML = '<i class="fa-solid fa-bell fa-lg top-10"></i><br><span style="font-size: 10px; color: var(--color-main-bright) !important;">FM Monitor</span>';
-      container.appendChild(btn);
-      if (typeof initTooltips === 'function') initTooltips($(btn));
-      if (typeof checkScroll === 'function') runtimeSetTimeout(checkScroll, 100);
-      attachClick();
-    };
-
-    const doAdd = () => {
-      if (document.getElementById('pushover-watchdog-button')) { attachClick(); return; }
-      if (typeof addIconToPluginPanel === 'function') {
-        addIconToPluginPanel('pushover-watchdog-button', 'FM Monitor', 'solid', 'bell', 'FM Monitor');
-        attachClick();
-      } else {
-        fallbackButtonCreate();
-      }
-    };
-
-    doAdd();
+  function addButton() {
+    if (!isAuthenticated()) {
+      removeButtons();
+      return;
+    }
+    addPanelButton('pushover-watchdog-button', 'FM Monitor', 'bell', 'FM Monitor', openModal);
+    addPanelButton('pushover-watchdog-rtlog-button', 'RT Log', 'scroll', 'RadioText log', openRtLogModal);
   }
 
   let started = false;
 
   function startWhenAuthenticated() {
     if (!isAuthenticated()) {
-      const existing = document.getElementById('pushover-watchdog-button');
-      if (existing) existing.remove();
+      removeButtons();
       return;
     }
 

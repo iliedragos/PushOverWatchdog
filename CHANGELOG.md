@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.0.1 - 2026-06-02
+
+- Added optional **RadioText logging** in the admin panel, with a dedicated top-panel log button and an admin-only RadioText history viewer.
+- Added configurable **Telegram Bot** notifications with independent enable/disable control and test action.
+- Added configurable **Zabbix sender / trapper** delivery with independent enable/disable control and test action.
+- Added per-channel notification enable switches so Pushover, Telegram and Zabbix can be used independently or together.
+- Added receiver settings applied after watchdog tune/retune: FM bandwidth selection including **AUTO**, and cEQ/iMS choices for keep current, enabled or disabled.
+- Updated `PushoverWatchdog.example.json` with the new notification, RadioText and receiver-option settings.
+
 ## 2026-05-26 - Signal conversion offset fix
 
 - Updated dBf to dBµV conversion offset from `10.875` to `11.25`, matching TEF firmware and FM-DX Webserver.

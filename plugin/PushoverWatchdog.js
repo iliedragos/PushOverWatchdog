@@ -1,7 +1,7 @@
 // Plugin configuration, this is used in the administration when plugins are loaded
 var pluginConfig = {
     name: 'Pushover Watchdog',
-    version: '1.0.0',
+    version: '1.0.1',
     author: 'by Play Radio Constanta',
     frontEndPath: 'PushoverWatchdog/pushover-watchdog.js'
 }

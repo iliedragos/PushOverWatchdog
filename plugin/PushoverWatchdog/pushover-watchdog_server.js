@@ -10,11 +10,15 @@
       3) RDS missing: RF signal present, but no valid RDS identity (PI or PS) is decoded for a configured period
       4) stereo indicator unstable/off: the webserver stereo flag drops repeatedly while signal/audio are otherwise OK
   - Sends optional recovery notifications.
+  - Provides rolling RadioText logging, retained for the most recent 7 days.
+  - Supports independently switchable Pushover, Telegram and Zabbix notification channels.
+  - Can re-apply receiver bandwidth / cEQ / iMS settings after watchdog-initiated tuning.
 */
 
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const net = require('net');
 const WebSocket = require('ws');
 
 const { logInfo, logWarn, logError } = require('../../server/console');
@@ -25,16 +29,28 @@ const audioServer = require('../../server/stream/3las.server');
 
 const PLUGIN_NAME = 'Pushover Watchdog';
 const CONFIG_PATH = path.join(__dirname, '../../plugins_configs/PushoverWatchdog.json');
+const RT_LOG_PATH = path.join(__dirname, '../../plugins_configs/PushoverWatchdog_RadioText.jsonl');
+const RT_SEQUENCE_STATE_PATH = path.join(__dirname, '../../plugins_configs/PushoverWatchdog_RadioText_state.json');
 const DBF_TO_DBUV_OFFSET = 11.25;
 const DBF_TO_DBM_OFFSET = 120;
 const MAX_PLUGIN_MESSAGE_BYTES = 65536;
 const MAX_PUSHOVER_MESSAGE_CHARS = 950;
+const MAX_TELEGRAM_MESSAGE_CHARS = 4000;
 const MAX_FREQUENCIES = 64;
 const MIN_TUNE_COMMAND_GAP_MS = 3000;
-const MAX_PUSHOVER_RESPONSE_BYTES = 32768;
+const MAX_NOTIFICATION_RESPONSE_BYTES = 32768;
 const MAX_CONFIG_STRING_CHARS = 512;
 const MAX_TEXT_WS_MESSAGE_BYTES = 262144;
 const MAX_STATUS_STRING_CHARS = 128;
+const RT_LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const RT_LOG_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+const MAX_RT_LOG_PAGE_SIZE = 250;
+const DEFAULT_RT_LOG_PAGE_SIZE = 100;
+const MAX_RT_SEQUENCE_STATES = 256;
+// FM-DX publishes RadioText progressively as characters are decoded. Wait until
+// the active RT message has remained unchanged before writing it to history.
+const RT_LOG_STABLE_MS = 4000;
+const RT_LOG_MIN_STABLE_OBSERVATIONS = 2;
 const RUNTIME_KEY = '__PushoverWatchdogRuntime';
 
 // FM-DX can reload plugins inside the same Node.js process. Keep a small
@@ -90,6 +106,7 @@ function runtimeAddCleanup(fn) {
 const defaultConfig = {
   enabled: true,
 
+  pushoverEnabled: true,
   pushoverUserKey: '',
   pushoverApiToken: '',
   pushoverDevice: '',
@@ -98,11 +115,27 @@ const defaultConfig = {
   pushoverRetrySeconds: 60,
   pushoverExpireSeconds: 1800,
 
+  telegramEnabled: false,
+  telegramBotToken: '',
+  telegramChatId: '',
+  telegramThreadId: '',
+
+  zabbixEnabled: false,
+  zabbixServer: '',
+  zabbixPort: 10051,
+  zabbixHost: 'FM-DX Webserver',
+  zabbixKey: 'fm_dx.watchdog.alert',
+
+  radioTextLoggingEnabled: false,
+
   frequencies: ['91.600'],
   checkIntervalSeconds: 2,
   tuneSettleSeconds: 4,
   dwellSeconds: 30,
   forceRetuneSeconds: 10,
+  forceRetuneBandwidthHz: 'keep',
+  forceRetuneCeq: 'keep',
+  forceRetuneIms: 'keep',
 
   signalUnit: 'dbuv',
   signalThreshold: 20,
@@ -134,11 +167,26 @@ const defaultConfig = {
 
 function mergeAndNormalizeConfig(rawConfig) {
   const merged = { ...defaultConfig, ...(rawConfig || {}) };
+  merged.pushoverEnabled = normalizeBoolean(merged.pushoverEnabled, defaultConfig.pushoverEnabled);
+  merged.telegramEnabled = normalizeBoolean(merged.telegramEnabled, defaultConfig.telegramEnabled);
+  merged.zabbixEnabled = normalizeBoolean(merged.zabbixEnabled, defaultConfig.zabbixEnabled);
+  merged.radioTextLoggingEnabled = normalizeBoolean(merged.radioTextLoggingEnabled, defaultConfig.radioTextLoggingEnabled);
   merged.frequencies = normalizeFrequencies(merged.frequencies);
   merged.pushoverUserKey = cleanConfigString(merged.pushoverUserKey, 128);
   merged.pushoverApiToken = cleanConfigString(merged.pushoverApiToken, 128);
   merged.pushoverDevice = cleanConfigString(merged.pushoverDevice, 128);
   merged.pushoverSound = cleanConfigString(merged.pushoverSound, 64) || defaultConfig.pushoverSound;
+  merged.telegramBotToken = cleanConfigString(merged.telegramBotToken, 256);
+  merged.telegramChatId = cleanConfigString(merged.telegramChatId, 128);
+  merged.telegramThreadId = cleanConfigString(merged.telegramThreadId, 32);
+  merged.zabbixServer = cleanConfigString(merged.zabbixServer, 255);
+  merged.zabbixHost = cleanConfigString(merged.zabbixHost, 255) || defaultConfig.zabbixHost;
+  merged.zabbixKey = cleanConfigString(merged.zabbixKey, 255) || defaultConfig.zabbixKey;
+  merged.zabbixPort = Math.trunc(positiveNumber(merged.zabbixPort, defaultConfig.zabbixPort, 1));
+  if (merged.zabbixPort > 65535) merged.zabbixPort = defaultConfig.zabbixPort;
+  merged.forceRetuneBandwidthHz = normalizeRetuneBandwidth(merged.forceRetuneBandwidthHz);
+  merged.forceRetuneCeq = normalizeReceiverToggle(merged.forceRetuneCeq);
+  merged.forceRetuneIms = normalizeReceiverToggle(merged.forceRetuneIms);
   merged.checkIntervalSeconds = positiveNumber(merged.checkIntervalSeconds, defaultConfig.checkIntervalSeconds, 1);
   merged.tuneSettleSeconds = positiveNumber(merged.tuneSettleSeconds, defaultConfig.tuneSettleSeconds, 0);
   merged.dwellSeconds = positiveNumber(merged.dwellSeconds, defaultConfig.dwellSeconds, 5);
@@ -164,6 +212,22 @@ function mergeAndNormalizeConfig(rawConfig) {
   return merged;
 }
 
+function normalizeBoolean(value, fallback = false) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (['true', '1', 'yes', 'on', 'enabled'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'off', 'disabled'].includes(normalized)) return false;
+  return Boolean(fallback);
+}
+
+function normalizeRadioTextFlag(value) {
+  const normalized = String(value ?? '').trim();
+  if (normalized === '0') return 0;
+  if (normalized === '1') return 1;
+  return null;
+}
+
 function finiteNumber(value, fallback) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
@@ -172,6 +236,18 @@ function finiteNumber(value, fallback) {
 function positiveNumber(value, fallback, min) {
   const n = Number(value);
   return Number.isFinite(n) ? Math.max(min, n) : fallback;
+}
+
+function normalizeReceiverToggle(value) {
+  const v = String(value ?? '').trim().toLowerCase();
+  return v === 'enabled' || v === 'disabled' ? v : 'keep';
+}
+
+function normalizeRetuneBandwidth(value) {
+  const v = String(value ?? '').trim().toLowerCase();
+  if (!v || v === 'keep') return 'keep';
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 && n <= 500000 ? Math.round(n) : 'keep';
 }
 
 function cleanConfigString(value, maxChars = MAX_CONFIG_STRING_CHARS) {
@@ -200,8 +276,12 @@ function sanitizeReceiverData(raw) {
     ps: safeStatusString(raw.ps, 16),
     rds: typeof raw.rds === 'boolean' || typeof raw.rds === 'number' ? raw.rds : safeStatusString(raw.rds, 32),
     st: typeof raw.st === 'boolean' || typeof raw.st === 'number' ? raw.st : safeStatusString(raw.st, 32),
+    bw: finiteNumber(raw.bw, NaN),
+    eq: typeof raw.eq === 'boolean' || typeof raw.eq === 'number' ? raw.eq : safeStatusString(raw.eq, 8),
+    ims: typeof raw.ims === 'boolean' || typeof raw.ims === 'number' ? raw.ims : safeStatusString(raw.ims, 8),
     rt0: safeStatusString(raw.rt0, 128),
-    rt1: safeStatusString(raw.rt1, 128)
+    rt1: safeStatusString(raw.rt1, 128),
+    rtFlag: normalizeRadioTextFlag(raw.rt_flag ?? raw.rtFlag)
   };
 }
 
@@ -282,7 +362,10 @@ function configAffectsFrequencyLoop(oldConfig, newConfig) {
     Number(oldConfig?.dwellSeconds) !== Number(newConfig?.dwellSeconds) ||
     Number(oldConfig?.tuneSettleSeconds) !== Number(newConfig?.tuneSettleSeconds) ||
     Number(oldConfig?.checkIntervalSeconds) !== Number(newConfig?.checkIntervalSeconds) ||
-    Number(oldConfig?.forceRetuneSeconds) !== Number(newConfig?.forceRetuneSeconds);
+    Number(oldConfig?.forceRetuneSeconds) !== Number(newConfig?.forceRetuneSeconds) ||
+    String(oldConfig?.forceRetuneBandwidthHz) !== String(newConfig?.forceRetuneBandwidthHz) ||
+    String(oldConfig?.forceRetuneCeq) !== String(newConfig?.forceRetuneCeq) ||
+    String(oldConfig?.forceRetuneIms) !== String(newConfig?.forceRetuneIms);
 }
 
 function applyConfig(nextConfig, reason) {
@@ -290,6 +373,10 @@ function applyConfig(nextConfig, reason) {
   config = mergeAndNormalizeConfig(nextConfig);
   if (previous && configAffectsFrequencyLoop(previous, config)) {
     resetFrequencyStates();
+  }
+  if (previous && previous.radioTextLoggingEnabled !== config.radioTextLoggingEnabled) {
+    clearPendingRadioTextCandidate();
+    if (config.radioTextLoggingEnabled) lastLoggedRtSignature = '';
   }
   sendPluginMessage('PushoverWatchdog:config', sanitizedConfigForUi(config));
   sendPluginMessage('PushoverWatchdog:status', currentStatusPayload());
@@ -402,6 +489,284 @@ let audioDataHandler = null;
 let audioCloseHandler = null;
 let textReconnectTimer = null;
 let connectingTextWebSocket = false;
+let radioTextLogEntries = [];
+// RadioText commonly alternates between two RDS A/B sequences (for example,
+// now-playing text and a station/promo message). Keep the latest settled value
+// for each sequence separately so that returning to an unchanged A or B text
+// is not recorded as a new event.
+let lastSettledRtBySequence = new Map();
+let lastRtLogPruneAt = 0;
+let pendingRtCandidate = null;
+let pendingRtTimer = null;
+
+function normalizeRadioTextLogEntry(raw) {
+  if (!isPlainObject(raw)) return null;
+  const timestamp = String(raw.timestamp || '');
+  const timestampMs = Date.parse(timestamp);
+  if (!Number.isFinite(timestampMs)) return null;
+  const rt = safeStatusString(raw.rt, 256);
+  if (!isNonEmptyText(rt)) return null;
+  return {
+    timestamp: new Date(timestampMs).toISOString(),
+    frequency: frequencyKey(raw.frequency),
+    pi: safeStatusString(raw.pi, 16),
+    ps: safeStatusString(raw.ps, 16),
+    rt,
+    rt0: safeStatusString(raw.rt0, 128),
+    rt1: safeStatusString(raw.rt1, 128),
+    rtFlag: normalizeRadioTextFlag(raw.rtFlag ?? raw.rt_flag)
+  };
+}
+
+function rewriteRadioTextLog() {
+  const dir = path.dirname(RT_LOG_PATH);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const tmpPath = `${RT_LOG_PATH}.tmp`;
+  const body = radioTextLogEntries.map(entry => JSON.stringify(entry)).join('\n');
+  fs.writeFileSync(tmpPath, body ? `${body}\n` : '', 'utf8');
+  fs.renameSync(tmpPath, RT_LOG_PATH);
+}
+
+function pruneRadioTextLog(now = Date.now(), forceRewrite = false) {
+  const cutoff = now - RT_LOG_RETENTION_MS;
+  const previousLength = radioTextLogEntries.length;
+  radioTextLogEntries = radioTextLogEntries.filter(entry => Date.parse(entry.timestamp) >= cutoff);
+  if (forceRewrite || radioTextLogEntries.length !== previousLength) rewriteRadioTextLog();
+  lastRtLogPruneAt = now;
+}
+
+function loadRadioTextLog() {
+  try {
+    if (!fs.existsSync(RT_LOG_PATH)) {
+      radioTextLogEntries = [];
+      rewriteRadioTextLog();
+      return;
+    }
+    radioTextLogEntries = fs.readFileSync(RT_LOG_PATH, 'utf8')
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map(line => {
+        try { return normalizeRadioTextLogEntry(JSON.parse(line)); } catch (_) { return null; }
+      })
+      .filter(Boolean)
+      .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+    pruneRadioTextLog(Date.now(), true);
+  } catch (err) {
+    radioTextLogEntries = [];
+    logWarn(`[${PLUGIN_NAME}] RadioText log could not be loaded: ${err.message}`);
+  }
+}
+
+function currentRadioText(data) {
+  const rt0 = isNonEmptyText(data?.rt0) ? String(data.rt0).trim() : '';
+  const rt1 = isNonEmptyText(data?.rt1) ? String(data.rt1).trim() : '';
+  const rtFlag = normalizeRadioTextFlag(data?.rtFlag ?? data?.rt_flag);
+
+  // FM-DX exposes RT A/B as rt0 and rt1 and identifies the active message via
+  // rt_flag. Never join the old and current buffers into one logged event.
+  let rt = '';
+  if (rtFlag === 0) rt = rt0;
+  else if (rtFlag === 1) rt = rt1;
+  else rt = rt0 || rt1; // compatibility fallback for payloads without rt_flag
+
+  return { rt, rt0, rt1, rtFlag };
+}
+
+function radioTextSignature(frequency, pi, ps, rt) {
+  // The signature represents the fully settled text for one station.
+  return [
+    frequencyKey(frequency),
+    safeStatusString(pi, 16),
+    safeStatusString(ps, 16),
+    safeStatusString(rt, 256)
+  ].join('|');
+}
+
+function radioTextSequenceKey(frequency, pi, ps, rtFlag) {
+  const normalizedFlag = normalizeRadioTextFlag(rtFlag);
+  const safePi = safeStatusString(pi, 16);
+  const safePs = safeStatusString(ps, 16);
+  const identity = safePi ? `pi:${safePi}` : `ps:${safePs}`;
+  const sequence = normalizedFlag === null ? 'single' : `rt${normalizedFlag}`;
+  return [frequencyKey(frequency), identity, sequence].join('|');
+}
+
+function rememberSettledRadioTextSequence(sequenceKey, signature) {
+  if (!isNonEmptyText(sequenceKey) || !isNonEmptyText(signature)) return;
+  // Refresh insertion order so an unusually large set of monitored services can
+  // be bounded without retaining stale receiver state forever.
+  lastSettledRtBySequence.delete(sequenceKey);
+  lastSettledRtBySequence.set(sequenceKey, signature);
+  while (lastSettledRtBySequence.size > MAX_RT_SEQUENCE_STATES) {
+    lastSettledRtBySequence.delete(lastSettledRtBySequence.keys().next().value);
+  }
+}
+
+function writeRadioTextSequenceState() {
+  try {
+    const dir = path.dirname(RT_SEQUENCE_STATE_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const tmpPath = `${RT_SEQUENCE_STATE_PATH}.tmp`;
+    const body = {
+      version: 1,
+      sequences: Object.fromEntries(lastSettledRtBySequence)
+    };
+    fs.writeFileSync(tmpPath, `${JSON.stringify(body, null, 2)}\n`, 'utf8');
+    fs.renameSync(tmpPath, RT_SEQUENCE_STATE_PATH);
+  } catch (err) {
+    logWarn(`[${PLUGIN_NAME}] RadioText sequence state could not be written: ${err.message}`);
+  }
+}
+
+function rebuildRadioTextSequenceStateFromRetainedLog() {
+  lastSettledRtBySequence = new Map();
+  for (const entry of radioTextLogEntries) {
+    const key = radioTextSequenceKey(entry.frequency, entry.pi, entry.ps, entry.rtFlag);
+    const signature = radioTextSignature(entry.frequency, entry.pi, entry.ps, entry.rt);
+    rememberSettledRadioTextSequence(key, signature);
+  }
+}
+
+function loadRadioTextSequenceState() {
+  try {
+    if (fs.existsSync(RT_SEQUENCE_STATE_PATH)) {
+      const parsed = JSON.parse(fs.readFileSync(RT_SEQUENCE_STATE_PATH, 'utf8'));
+      if (isPlainObject(parsed) && isPlainObject(parsed.sequences)) {
+        lastSettledRtBySequence = new Map();
+        for (const [key, signature] of Object.entries(parsed.sequences)) {
+          if (isNonEmptyText(key) && isNonEmptyText(signature)) {
+            rememberSettledRadioTextSequence(key, signature);
+          }
+        }
+        return;
+      }
+    }
+  } catch (err) {
+    logWarn(`[${PLUGIN_NAME}] RadioText sequence state could not be loaded: ${err.message}`);
+  }
+  // Existing installations do not yet have a state file. Seed the sequence
+  // tracker from retained history so the upgrade does not immediately repeat
+  // the most recently recorded A/B texts.
+  rebuildRadioTextSequenceStateFromRetainedLog();
+  writeRadioTextSequenceState();
+}
+
+function clearPendingRadioTextCandidate() {
+  runtimeClearTimer(pendingRtTimer);
+  pendingRtTimer = null;
+  pendingRtCandidate = null;
+}
+
+runtimeAddCleanup(clearPendingRadioTextCandidate);
+
+function appendFinalRadioTextEntry(candidate) {
+  if (!candidate) return;
+  if (lastSettledRtBySequence.get(candidate.sequenceKey) === candidate.signature) return;
+  const entry = {
+    timestamp: new Date().toISOString(),
+    frequency: candidate.frequency,
+    pi: candidate.pi,
+    ps: candidate.ps,
+    rt: candidate.rt,
+    rt0: candidate.rt0,
+    rt1: candidate.rt1,
+    rtFlag: candidate.rtFlag
+  };
+
+  try {
+    fs.appendFileSync(RT_LOG_PATH, `${JSON.stringify(entry)}\n`, 'utf8');
+    radioTextLogEntries.push(entry);
+    rememberSettledRadioTextSequence(candidate.sequenceKey, candidate.signature);
+    writeRadioTextSequenceState();
+    if (!lastRtLogPruneAt || Date.now() - lastRtLogPruneAt >= RT_LOG_CLEANUP_INTERVAL_MS) {
+      pruneRadioTextLog(Date.now(), true);
+    }
+    sendPluginMessage('PushoverWatchdog:rtLogChanged', { latest: entry });
+  } catch (err) {
+    logWarn(`[${PLUGIN_NAME}] RadioText log write failed: ${err.message}`);
+  }
+}
+
+function commitPendingRadioTextCandidate(expectedSignature) {
+  pendingRtTimer = null;
+  const candidate = pendingRtCandidate;
+  if (!candidate || candidate.signature !== expectedSignature) return;
+  if (candidate.confirmations < RT_LOG_MIN_STABLE_OBSERVATIONS) {
+    clearPendingRadioTextCandidate();
+    return;
+  }
+
+  const latestData = lastData;
+  const latestText = currentRadioText(latestData);
+  const latestSignature = radioTextSignature(latestData?.freq, latestData?.pi, latestData?.ps, latestText.rt);
+  if (!config.radioTextLoggingEnabled || !isRdsPresent(latestData) || !hasValidRdsIdentity(latestData) || latestSignature !== expectedSignature) {
+    clearPendingRadioTextCandidate();
+    return;
+  }
+
+  appendFinalRadioTextEntry(candidate);
+  clearPendingRadioTextCandidate();
+}
+
+function recordRadioTextIfChanged(data) {
+  if (!config.radioTextLoggingEnabled || !data || !isRdsPresent(data) || !hasValidRdsIdentity(data)) {
+    clearPendingRadioTextCandidate();
+    return;
+  }
+
+  const text = currentRadioText(data);
+  if (!isNonEmptyText(text.rt)) {
+    clearPendingRadioTextCandidate();
+    return;
+  }
+
+  const signature = radioTextSignature(data.freq, data.pi, data.ps, text.rt);
+  const sequenceKey = radioTextSequenceKey(data.freq, data.pi, data.ps, text.rtFlag);
+  if (lastSettledRtBySequence.get(sequenceKey) === signature) {
+    clearPendingRadioTextCandidate();
+    return;
+  }
+
+  const candidate = {
+    signature,
+    sequenceKey,
+    frequency: frequencyKey(data.freq),
+    pi: safeStatusString(data.pi, 16),
+    ps: safeStatusString(data.ps, 16),
+    rt: safeStatusString(text.rt, 256),
+    rt0: safeStatusString(text.rt0, 128),
+    rt1: safeStatusString(text.rt1, 128),
+    rtFlag: text.rtFlag,
+    confirmations: 1
+  };
+
+  if (pendingRtCandidate && pendingRtCandidate.signature === signature) {
+    pendingRtCandidate = { ...candidate, confirmations: pendingRtCandidate.confirmations + 1 };
+    return;
+  }
+
+  clearPendingRadioTextCandidate();
+  pendingRtCandidate = candidate;
+  pendingRtTimer = runtimeSetTimeout(() => commitPendingRadioTextCandidate(signature), RT_LOG_STABLE_MS);
+}
+
+function radioTextLogPage(request = {}) {
+  pruneRadioTextLog(Date.now(), false);
+  const requestedLimit = Math.trunc(finiteNumber(request.limit, DEFAULT_RT_LOG_PAGE_SIZE));
+  const limit = Math.max(1, Math.min(MAX_RT_LOG_PAGE_SIZE, requestedLimit));
+  const beforeMs = request.before ? Date.parse(String(request.before)) : Infinity;
+  const matching = radioTextLogEntries
+    .filter(entry => !Number.isFinite(beforeMs) || Date.parse(entry.timestamp) < beforeMs)
+    .slice()
+    .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+  const entries = matching.slice(0, limit);
+  return {
+    entries,
+    retentionDays: 7,
+    hasMore: matching.length > entries.length,
+    nextBefore: entries.length ? entries[entries.length - 1].timestamp : null
+  };
+}
 
 function logDebug(message) {
   if (config.debugLogging) logInfo(`[${PLUGIN_NAME}] ${message}`);
@@ -446,7 +811,9 @@ function resetFrequencyStates() {
 
 
 function isSensitivePluginMessage(type) {
-  return type === 'PushoverWatchdog:config' || type === 'PushoverWatchdog:toast';
+  return type === 'PushoverWatchdog:config' ||
+    type === 'PushoverWatchdog:toast' ||
+    type === 'PushoverWatchdog:rtLogChanged';
 }
 
 function sendPluginMessage(type, value) {
@@ -603,6 +970,7 @@ function connectTextWebSocket() {
         return;
       }
       lastData = sanitizeReceiverData(JSON.parse(message.toString()));
+      recordRadioTextIfChanged(lastData);
     } catch (_) {}
   });
   textWs.on('error', err => {
@@ -659,6 +1027,12 @@ function registerPluginWebSocketAuthHandlers() {
         return;
       }
 
+      if (event.type === 'PushoverWatchdog:getRtLog') {
+        if (!isAuthenticatedWs(client)) return rejectUnauthenticated(client, 'view RadioText log');
+        sendPluginMessageTo(client, 'PushoverWatchdog:rtLogPage', radioTextLogPage(isPlainObject(event.value) ? event.value : {}));
+        return;
+      }
+
       if (event.type === 'PushoverWatchdog:saveConfig') {
         if (!isAuthenticatedWs(client)) return rejectUnauthenticated(client, 'save Pushover Watchdog settings');
         try {
@@ -672,11 +1046,13 @@ function registerPluginWebSocketAuthHandlers() {
         return;
       }
 
-      if (event.type === 'PushoverWatchdog:test') {
-        if (!isAuthenticatedWs(client)) return rejectUnauthenticated(client, 'send Pushover Watchdog test notifications');
-        sendPushover('FM-DX Watchdog test', 'Test notification from Pushover Watchdog.', 'test')
-          .then(() => sendPluginMessageTo(client, 'PushoverWatchdog:toast', { level: 'success', message: 'Test notification sent.' }))
-          .catch(err => sendPluginMessageTo(client, 'PushoverWatchdog:toast', { level: 'error', message: `Pushover test failed: ${err.message}` }));
+      if (event.type === 'PushoverWatchdog:test' || event.type === 'PushoverWatchdog:testChannel') {
+        if (!isAuthenticatedWs(client)) return rejectUnauthenticated(client, 'send FM Monitor test notifications');
+        const channel = event.type === 'PushoverWatchdog:test' ? 'pushover' : String(event.value?.channel || '').toLowerCase();
+        sendTestNotification(channel)
+          .then(() => sendPluginMessageTo(client, 'PushoverWatchdog:toast', { level: 'success', message: `${channelLabel(channel)} test notification sent.` }))
+          .catch(err => sendPluginMessageTo(client, 'PushoverWatchdog:toast', { level: 'error', message: `${channelLabel(channel)} test failed: ${err.message}` }));
+        return;
       }
     });
   };
@@ -709,6 +1085,44 @@ function isObservedOnFrequency(freq, toleranceMhz = 0.015) {
   return Number.isFinite(observed) && Number.isFinite(target) && Math.abs(observed - target) <= toleranceMhz;
 }
 
+function receiverBoolean(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value > 0;
+  const v = String(value ?? '').trim().toLowerCase();
+  if (v === '1' || v === 'true' || v === 'on' || v === 'enabled') return true;
+  if (v === '0' || v === 'false' || v === 'off' || v === 'disabled') return false;
+  return null;
+}
+
+function applyReceiverOptionsAfterTune(reason) {
+  const commands = [];
+  if (config.forceRetuneBandwidthHz !== 'keep') {
+    commands.push(`W${config.forceRetuneBandwidthHz}`);
+  }
+
+  if (config.forceRetuneCeq !== 'keep' || config.forceRetuneIms !== 'keep') {
+    const d = lastData || sanitizeReceiverData(dataHandler.dataToSend) || {};
+    const observedCeq = receiverBoolean(d.eq);
+    const observedIms = receiverBoolean(d.ims);
+    if ((config.forceRetuneCeq === 'keep' && observedCeq === null) || (config.forceRetuneIms === 'keep' && observedIms === null)) {
+      logWarn(`[${PLUGIN_NAME}] Skipped cEQ/iMS retune option because the existing state could not be preserved.`);
+    } else {
+      const ceq = config.forceRetuneCeq === 'keep' ? observedCeq : config.forceRetuneCeq === 'enabled';
+      const ims = config.forceRetuneIms === 'keep' ? observedIms : config.forceRetuneIms === 'enabled';
+      commands.push(`G${ceq ? '1' : '0'}${ims ? '1' : '0'}`);
+    }
+  }
+
+  for (const command of commands) {
+    Promise.resolve(pluginsApi.sendPrivilegedCommand(command, true))
+      .then(ok => {
+        if (ok) logDebug(`Applied receiver option ${command} after tune (${reason}).`);
+        else logWarn(`[${PLUGIN_NAME}] Could not apply receiver option ${command} after tune (${reason}).`);
+      })
+      .catch(err => logWarn(`[${PLUGIN_NAME}] Receiver option command ${command} failed after tune (${reason}): ${err.message}`));
+  }
+}
+
 function tuneTo(freq, reason = 'scheduled', options = {}) {
   const mhz = Number(freq);
   if (!Number.isFinite(mhz)) return;
@@ -732,8 +1146,12 @@ function tuneTo(freq, reason = 'scheduled', options = {}) {
   const command = `T${Math.round(mhz * 1000)}`;
   Promise.resolve(pluginsApi.sendPrivilegedCommand(command, true))
     .then(ok => {
-      if (ok) logDebug(`Tuned to ${key} MHz (${reason})`);
-      else logWarn(`[${PLUGIN_NAME}] Could not tune to ${key} MHz (${reason}).`);
+      if (ok) {
+        logDebug(`Tuned to ${key} MHz (${reason})`);
+        applyReceiverOptionsAfterTune(reason);
+      } else {
+        logWarn(`[${PLUGIN_NAME}] Could not tune to ${key} MHz (${reason}).`);
+      }
     })
     .catch(err => logWarn(`[${PLUGIN_NAME}] Tune command failed for ${key} MHz (${reason}): ${err.message}`));
 }
@@ -792,6 +1210,11 @@ function currentStatusPayload() {
     stereoRaw: d.st,
     rt0: d.rt0,
     rt1: d.rt1,
+    bw: d.bw,
+    eq: d.eq,
+    ims: d.ims,
+    radioTextLoggingEnabled: !!config.radioTextLoggingEnabled,
+    radioTextLogCount: radioTextLogEntries.length,
     audioDbfs: Number.isFinite(currentAudio.dbfs) ? Number(currentAudio.dbfs.toFixed(1)) : null,
     audioAttached: currentAudio.attached,
     audioAgeSeconds: currentAudio.lastUpdate ? Number(((Date.now() - currentAudio.lastUpdate) / 1000).toFixed(1)) : null,
@@ -1084,9 +1507,47 @@ function sendAlert(kind, freq, data, reason) {
     formatRds(data)
   ].filter(Boolean).join('\n');
 
-  sendPushover(titleMap[kind] || 'FM-DX Watchdog', message, kind)
-    .then(() => logInfo(`[${PLUGIN_NAME}] Pushover alert sent: ${kind} ${frequencyKey(freq)} MHz.`))
-    .catch(err => logError(`[${PLUGIN_NAME}] Pushover alert failed: ${err.message}`));
+  dispatchNotifications(titleMap[kind] || 'FM-DX Watchdog', message, kind, freq);
+}
+
+function channelLabel(channel) {
+  const names = { pushover: 'Pushover', telegram: 'Telegram', zabbix: 'Zabbix' };
+  return names[channel] || 'Notification channel';
+}
+
+function notificationPayload(title, message, kind, freq) {
+  return {
+    title,
+    message,
+    kind,
+    frequency: Number.isFinite(Number(freq)) ? frequencyKey(freq) : '',
+    timestamp: new Date().toISOString()
+  };
+}
+
+function sendTestNotification(channel) {
+  const title = 'FM-DX Watchdog test';
+  const message = 'Test notification from FM Monitor.';
+  if (channel === 'pushover') return sendPushover(title, message, 'test');
+  if (channel === 'telegram') return sendTelegram(title, message, 'test');
+  if (channel === 'zabbix') return sendZabbix(title, message, 'test');
+  return Promise.reject(new Error('Unknown notification channel.'));
+}
+
+function dispatchNotifications(title, message, kind, freq) {
+  const tasks = [];
+  if (config.pushoverEnabled) tasks.push({ channel: 'pushover', promise: sendPushover(title, message, kind) });
+  if (config.telegramEnabled) tasks.push({ channel: 'telegram', promise: sendTelegram(title, message, kind) });
+  if (config.zabbixEnabled) tasks.push({ channel: 'zabbix', promise: sendZabbix(title, message, kind, freq) });
+  if (!tasks.length) {
+    logDebug(`Alert ${kind} was detected, but all notification channels are disabled.`);
+    return;
+  }
+  for (const task of tasks) {
+    task.promise
+      .then(() => logInfo(`[${PLUGIN_NAME}] ${channelLabel(task.channel)} alert sent: ${kind}${Number.isFinite(Number(freq)) ? ` ${frequencyKey(freq)} MHz` : ''}.`))
+      .catch(err => logError(`[${PLUGIN_NAME}] ${channelLabel(task.channel)} alert failed: ${err.message}`));
+  }
 }
 
 function truncateText(value, maxChars) {
@@ -1131,7 +1592,7 @@ function sendPushover(title, message, kind) {
       let responseBytes = 0;
       res.on('data', chunk => {
         responseBytes += chunk.length || Buffer.byteLength(String(chunk));
-        if (responseBytes <= MAX_PUSHOVER_RESPONSE_BYTES) {
+        if (responseBytes <= MAX_NOTIFICATION_RESPONSE_BYTES) {
           response += chunk.toString();
         }
       });
@@ -1147,9 +1608,134 @@ function sendPushover(title, message, kind) {
   });
 }
 
+function sendTelegram(title, message, kind) {
+  return new Promise((resolve, reject) => {
+    if (!config.telegramBotToken || !config.telegramChatId) {
+      reject(new Error('Telegram Bot Token or Chat ID is missing.'));
+      return;
+    }
+    if (!/^[0-9]+:[A-Za-z0-9_-]+$/.test(config.telegramBotToken)) {
+      reject(new Error('Telegram Bot Token format is invalid.'));
+      return;
+    }
+
+    const payload = new URLSearchParams();
+    payload.set('chat_id', config.telegramChatId);
+    payload.set('text', truncateText(`${title}\n\n${message}`, MAX_TELEGRAM_MESSAGE_CHARS));
+    payload.set('disable_web_page_preview', 'true');
+    if (config.telegramThreadId) payload.set('message_thread_id', config.telegramThreadId);
+
+    const body = payload.toString();
+    const req = https.request({
+      method: 'POST',
+      hostname: 'api.telegram.org',
+      path: `/bot${config.telegramBotToken}/sendMessage`,
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body)
+      },
+      timeout: 10000
+    }, (res) => {
+      let response = '';
+      let responseBytes = 0;
+      res.on('data', chunk => {
+        responseBytes += chunk.length || Buffer.byteLength(String(chunk));
+        if (responseBytes <= MAX_NOTIFICATION_RESPONSE_BYTES) response += chunk.toString();
+      });
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) resolve(response);
+        else reject(new Error(`HTTP ${res.statusCode}: ${truncateText(response, 512)}`));
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('Telegram request timeout')));
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+function sendZabbix(title, message, kind, freq) {
+  return new Promise((resolve, reject) => {
+    if (!config.zabbixServer || !config.zabbixHost || !config.zabbixKey) {
+      reject(new Error('Zabbix server, host name or trapper key is missing.'));
+      return;
+    }
+
+    const event = notificationPayload(title, message, kind, freq);
+    const requestPayload = Buffer.from(JSON.stringify({
+      request: 'sender data',
+      data: [{
+        host: config.zabbixHost,
+        key: config.zabbixKey,
+        value: JSON.stringify(event),
+        clock: Math.floor(Date.now() / 1000)
+      }]
+    }), 'utf8');
+    const header = Buffer.alloc(13);
+    header.write('ZBXD\x01', 0, 'binary');
+    header.writeBigUInt64LE(BigInt(requestPayload.length), 5);
+    const socket = net.createConnection({ host: config.zabbixServer, port: config.zabbixPort });
+    let response = Buffer.alloc(0);
+    let settled = false;
+
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      try { socket.destroy(); } catch (_) {}
+      if (error) reject(error); else resolve(value);
+    };
+
+    const parseResponseIfComplete = () => {
+      if (response.length < 13 || response.subarray(0, 5).toString('binary') !== 'ZBXD\x01') return false;
+      const expectedLength = Number(response.readBigUInt64LE(5));
+      if (!Number.isSafeInteger(expectedLength) || expectedLength < 0 || expectedLength > MAX_NOTIFICATION_RESPONSE_BYTES) {
+        finish(new Error('Invalid or oversized Zabbix response.'));
+        return true;
+      }
+      if (response.length < 13 + expectedLength) return false;
+      try {
+        const body = response.subarray(13, 13 + expectedLength).toString('utf8');
+        const parsed = body ? JSON.parse(body) : {};
+        const failed = typeof parsed.info === 'string'
+          ? Number((parsed.info.match(/failed:\s*(\d+)/i) || [])[1] || 0)
+          : 0;
+        if (parsed.response !== 'success' || failed > 0) {
+          finish(new Error(`Zabbix rejected data: ${truncateText(parsed.info || body, 512)}`));
+        } else {
+          finish(null, parsed);
+        }
+      } catch (err) {
+        finish(new Error(`Invalid Zabbix response: ${err.message}`));
+      }
+      return true;
+    };
+
+    socket.setTimeout(10000);
+    socket.on('connect', () => socket.write(Buffer.concat([header, requestPayload])));
+    socket.on('data', chunk => {
+      if (response.length + chunk.length > MAX_NOTIFICATION_RESPONSE_BYTES + 13) {
+        finish(new Error('Oversized Zabbix response.'));
+        return;
+      }
+      response = Buffer.concat([response, chunk]);
+      parseResponseIfComplete();
+    });
+    socket.on('end', () => {
+      if (!settled && !parseResponseIfComplete()) {
+        finish(new Error('Incomplete Zabbix response.'));
+      }
+    });
+    socket.on('timeout', () => finish(new Error('Zabbix connection timeout')));
+    socket.on('error', err => finish(err));
+  });
+}
+
+loadRadioTextLog();
+loadRadioTextSequenceState();
 startConfigHotReload();
 connectTextWebSocket();
 registerPluginWebSocketAuthHandlers();
 runtimeSetInterval(tick, 1000);
+runtimeSetInterval(() => pruneRadioTextLog(Date.now(), true), RT_LOG_CLEANUP_INTERVAL_MS);
 
 logInfo(`[${PLUGIN_NAME}] Loaded. Config: ${CONFIG_PATH}`);

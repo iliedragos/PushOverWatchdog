@@ -1,5 +1,6 @@
 {
   "enabled": true,
+  "pushoverEnabled": true,
   "pushoverUserKey": "YOUR_PUSHOVER_USER_KEY",
   "pushoverApiToken": "YOUR_PUSHOVER_API_TOKEN",
   "pushoverDevice": "",
@@ -7,6 +8,16 @@
   "pushoverPriority": 0,
   "pushoverRetrySeconds": 60,
   "pushoverExpireSeconds": 1800,
+  "telegramEnabled": false,
+  "telegramBotToken": "YOUR_TELEGRAM_BOT_TOKEN",
+  "telegramChatId": "YOUR_TELEGRAM_CHAT_ID",
+  "telegramThreadId": "",
+  "zabbixEnabled": false,
+  "zabbixServer": "127.0.0.1",
+  "zabbixPort": 10051,
+  "zabbixHost": "FM-DX Webserver",
+  "zabbixKey": "fm_dx.watchdog.alert",
+  "radioTextLoggingEnabled": false,
   "frequencies": [
     "91.600"
   ],
@@ -14,6 +25,9 @@
   "tuneSettleSeconds": 4,
   "dwellSeconds": 30,
   "forceRetuneSeconds": 10,
+  "forceRetuneBandwidthHz": "keep",
+  "forceRetuneCeq": "keep",
+  "forceRetuneIms": "keep",
   "signalUnit": "dbuv",
   "signalThreshold": 20,
   "noCarrierSeconds": 20,
