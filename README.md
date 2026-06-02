@@ -15,7 +15,7 @@ The plugin is designed for FM monitoring setups using TEF / Headless TEF receive
 - Missing valid RDS detection
 - Stereo indicator instability detection
 - Recovery notifications
-- Pushover alert integration
+- Pushover, Telegram & Zabbix alert integration
 - Configurable monitored frequency or frequency list
 - Configurable force-retune interval
 - Hot-reload configuration support
