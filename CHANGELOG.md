@@ -8,6 +8,17 @@
 - Added per-channel notification enable switches so Pushover, Telegram and Zabbix can be used independently or together.
 - Added receiver settings applied after watchdog tune/retune: FM bandwidth selection including **AUTO**, and cEQ/iMS choices for keep current, enabled or disabled.
 - Updated `PushoverWatchdog.example.json` with the new notification, RadioText and receiver-option settings.
+- Fixed a backend regression that could raise an error when **RadioText logging** was enabled or disabled after per-sequence A/B deduplication was introduced.
+- Hardened administration access: settings, test actions, live status and RadioText history are now delivered only to administrator-authenticated plugin sessions.
+- Prevented Pushover and Telegram credentials from being sent through FM-DX Webserver's shared plugin WebSocket; the admin panel preserves server-side credentials, which must now be entered directly in `plugins_configs/PushoverWatchdog.json`.
+- Added conservative storage hardening: private POSIX permissions (`0600` where supported), exclusive atomic temporary files, configuration/state/log size safeguards and a bounded RadioText in-memory history.
+- Added backend and frontend hot-reload cleanup for WebSocket/listener/DOM handlers, plus bounded stereo-history samples, preventing gradual memory/listener accumulation on long-running or repeatedly reloaded installations.
+- Normalized every boolean configuration switch loaded from JSON, so values such as `"false"` or `"0"` cannot be misinterpreted as enabled.
+- Prevented a valid Pushover/Telegram token edited directly in the server JSON file from being overwritten by an almost simultaneous panel save before hot-reload completes.
+- Hardened normal RadioText append writes against POSIX symbolic-link redirection without replacing the efficient append-based logging path.
+- Reduced RadioText history paging memory/CPU overhead by reading requested pages backwards from the already ordered in-memory retention list instead of copying and sorting the full retained history.
+- Detached live audio analysis while monitoring is disabled and completed missing abort/close handling for Pushover, Telegram and Zabbix requests, preventing avoidable retained resources on interrupted deliveries.
+- Added a browser-side admin-session guard that closes the plugin WebSocket and clears the admin UI when the current page is no longer authenticated as administrator.
 
 ## 2026-05-26 - Signal conversion offset fix
 

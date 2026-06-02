@@ -19,6 +19,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const net = require('net');
+const crypto = require('crypto');
 const WebSocket = require('ws');
 
 const { logInfo, logWarn, logError } = require('../../server/console');
@@ -47,6 +48,14 @@ const RT_LOG_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 const MAX_RT_LOG_PAGE_SIZE = 250;
 const DEFAULT_RT_LOG_PAGE_SIZE = 100;
 const MAX_RT_SEQUENCE_STATES = 256;
+// Hard safety bounds: normal seven-day rolling retention remains unchanged, while
+// malformed or abnormally noisy input cannot grow memory/disk without limit.
+const MAX_CONFIG_FILE_BYTES = 256 * 1024;
+const MAX_RT_SEQUENCE_STATE_FILE_BYTES = 256 * 1024;
+const MAX_RT_LOG_FILE_BYTES = 32 * 1024 * 1024;
+const MAX_RT_LOG_ENTRIES = 100000;
+const MAX_STEREO_HISTORY_SAMPLES = 7200;
+const PRIVATE_FILE_MODE = 0o600;
 // FM-DX publishes RadioText progressively as characters are decoded. Wait until
 // the active RT message has remained unchanged before writing it to history.
 const RT_LOG_STABLE_MS = 4000;
@@ -167,10 +176,20 @@ const defaultConfig = {
 
 function mergeAndNormalizeConfig(rawConfig) {
   const merged = { ...defaultConfig, ...(rawConfig || {}) };
+  merged.enabled = normalizeBoolean(merged.enabled, defaultConfig.enabled);
   merged.pushoverEnabled = normalizeBoolean(merged.pushoverEnabled, defaultConfig.pushoverEnabled);
   merged.telegramEnabled = normalizeBoolean(merged.telegramEnabled, defaultConfig.telegramEnabled);
   merged.zabbixEnabled = normalizeBoolean(merged.zabbixEnabled, defaultConfig.zabbixEnabled);
   merged.radioTextLoggingEnabled = normalizeBoolean(merged.radioTextLoggingEnabled, defaultConfig.radioTextLoggingEnabled);
+  merged.requireCarrierForRds = normalizeBoolean(merged.requireCarrierForRds, defaultConfig.requireCarrierForRds);
+  merged.requireCarrierForBlank = normalizeBoolean(merged.requireCarrierForBlank, defaultConfig.requireCarrierForBlank);
+  merged.stereoMonitorEnabled = normalizeBoolean(merged.stereoMonitorEnabled, defaultConfig.stereoMonitorEnabled);
+  merged.stereoRequireCarrier = normalizeBoolean(merged.stereoRequireCarrier, defaultConfig.stereoRequireCarrier);
+  merged.stereoRequireAudio = normalizeBoolean(merged.stereoRequireAudio, defaultConfig.stereoRequireAudio);
+  merged.stereoRequireRdsValid = normalizeBoolean(merged.stereoRequireRdsValid, defaultConfig.stereoRequireRdsValid);
+  merged.sendRecoveryNotifications = normalizeBoolean(merged.sendRecoveryNotifications, defaultConfig.sendRecoveryNotifications);
+  merged.includeRdsInfo = normalizeBoolean(merged.includeRdsInfo, defaultConfig.includeRdsInfo);
+  merged.debugLogging = normalizeBoolean(merged.debugLogging, defaultConfig.debugLogging);
   merged.frequencies = normalizeFrequencies(merged.frequencies);
   merged.pushoverUserKey = cleanConfigString(merged.pushoverUserKey, 128);
   merged.pushoverApiToken = cleanConfigString(merged.pushoverApiToken, 128);
@@ -318,11 +337,60 @@ function formatSignal(rawDbf) {
   return `${main} (raw ${raw.toFixed(1)} dBf)`;
 }
 
+function readBoundedUtf8File(filePath, maxBytes, description) {
+  const size = fs.statSync(filePath).size;
+  if (size > maxBytes) throw new Error(`${description} exceeds the safety limit of ${maxBytes} bytes.`);
+  return fs.readFileSync(filePath, 'utf8');
+}
+
+function restrictPrivateFile(filePath) {
+  if (process.platform === 'win32') return;
+  try { fs.chmodSync(filePath, PRIVATE_FILE_MODE); } catch (_) {}
+}
+
+function writePrivateFileAtomic(filePath, contents) {
+  // Keep transient files private and avoid a predictable temporary filename.
+  // The exclusive create prevents overwriting an attacker-created symlink on
+  // multi-user POSIX hosts where the configuration directory is writable.
+  const tmpPath = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, contents, { encoding: 'utf8', mode: PRIVATE_FILE_MODE, flag: 'wx' });
+    restrictPrivateFile(tmpPath);
+    fs.renameSync(tmpPath, filePath);
+    restrictPrivateFile(filePath);
+  } finally {
+    try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (_) {}
+  }
+}
+
+function appendPrivateUtf8File(filePath, contents) {
+  // Preserve efficient append behaviour for the rolling log while refusing to
+  // follow a substituted symbolic link on POSIX systems.
+  const noFollow = typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0;
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | noFollow;
+  let fd;
+  try {
+    fd = fs.openSync(filePath, flags, PRIVATE_FILE_MODE);
+    fs.writeFileSync(fd, contents, { encoding: 'utf8' });
+  } catch (err) {
+    if (err && (err.code === 'ELOOP' || err.code === 'EMLINK')) {
+      throw new Error('Refused to append to a symbolic-link RadioText log path.');
+    }
+    throw err;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch (_) {}
+    }
+  }
+  restrictPrivateFile(filePath);
+}
+
 function readConfigFile() {
   let existing = {};
   if (fs.existsSync(CONFIG_PATH)) {
-    const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) || {};
+    const parsed = JSON.parse(readBoundedUtf8File(CONFIG_PATH, MAX_CONFIG_FILE_BYTES, 'Pushover Watchdog config')) || {};
     existing = isPlainObject(parsed) ? parsed : {};
+    restrictPrivateFile(CONFIG_PATH);
   }
   return mergeAndNormalizeConfig(existing);
 }
@@ -345,9 +413,7 @@ function ensureConfig() {
 }
 
 function writeConfigFile(nextConfig) {
-  const tmpPath = `${CONFIG_PATH}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(nextConfig, null, 2), 'utf8');
-  fs.renameSync(tmpPath, CONFIG_PATH);
+  writePrivateFileAtomic(CONFIG_PATH, `${JSON.stringify(nextConfig, null, 2)}\n`);
   rememberConfigMtime();
 }
 
@@ -375,8 +441,9 @@ function applyConfig(nextConfig, reason) {
     resetFrequencyStates();
   }
   if (previous && previous.radioTextLoggingEnabled !== config.radioTextLoggingEnabled) {
+    // Pending progressive RT must not survive a logging toggle. The settled A/B
+    // sequence state deliberately remains intact to avoid duplicate entries.
     clearPendingRadioTextCandidate();
-    if (config.radioTextLoggingEnabled) lastLoggedRtSignature = '';
   }
   sendPluginMessage('PushoverWatchdog:config', sanitizedConfigForUi(config));
   sendPluginMessage('PushoverWatchdog:status', currentStatusPayload());
@@ -434,7 +501,27 @@ function scheduleConfigReload(reason) {
 }
 
 function saveConfig(newConfig) {
-  const merged = mergeAndNormalizeConfig(newConfig);
+  // FM-DX broadcasts client-originated /data_plugins messages to other plugin
+  // clients. Never accept or transport high-value notification secrets in the
+  // browser save payload; retain credentials from the latest valid server-side
+  // config. Reading once here avoids overwriting a token that an administrator
+  // has just edited directly before fs.watch/polling has reloaded it.
+  const uiUpdate = isPlainObject(newConfig) ? { ...newConfig } : {};
+  delete uiUpdate.pushoverUserKey;
+  delete uiUpdate.pushoverApiToken;
+  delete uiUpdate.telegramBotToken;
+  let secretSource = config;
+  try {
+    secretSource = readConfigFile();
+  } catch (err) {
+    logWarn(`[${PLUGIN_NAME}] UI save kept the loaded notification credentials because the on-disk config was not valid at save time: ${err.message}`);
+  }
+  const merged = mergeAndNormalizeConfig({
+    ...uiUpdate,
+    pushoverUserKey: secretSource.pushoverUserKey,
+    pushoverApiToken: secretSource.pushoverApiToken,
+    telegramBotToken: secretSource.telegramBotToken
+  });
   writeConfigFile(merged);
   applyConfig(merged, 'UI save');
   return merged;
@@ -521,16 +608,40 @@ function normalizeRadioTextLogEntry(raw) {
 function rewriteRadioTextLog() {
   const dir = path.dirname(RT_LOG_PATH);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const tmpPath = `${RT_LOG_PATH}.tmp`;
   const body = radioTextLogEntries.map(entry => JSON.stringify(entry)).join('\n');
-  fs.writeFileSync(tmpPath, body ? `${body}\n` : '', 'utf8');
-  fs.renameSync(tmpPath, RT_LOG_PATH);
+  writePrivateFileAtomic(RT_LOG_PATH, body ? `${body}\n` : '');
+}
+
+function readRadioTextLogBounded() {
+  const size = fs.statSync(RT_LOG_PATH).size;
+  if (size <= MAX_RT_LOG_FILE_BYTES) {
+    restrictPrivateFile(RT_LOG_PATH);
+    return fs.readFileSync(RT_LOG_PATH, 'utf8');
+  }
+  const fd = fs.openSync(RT_LOG_PATH, 'r');
+  try {
+    const start = size - MAX_RT_LOG_FILE_BYTES;
+    const buffer = Buffer.alloc(MAX_RT_LOG_FILE_BYTES);
+    const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, start);
+    let tail = buffer.subarray(0, bytesRead).toString('utf8');
+    const firstNewLine = tail.indexOf('\n');
+    tail = firstNewLine >= 0 ? tail.slice(firstNewLine + 1) : '';
+    logWarn(`[${PLUGIN_NAME}] RadioText log exceeded the memory safety cap; only the most recent bounded tail was retained.`);
+    return tail;
+  } finally {
+    fs.closeSync(fd);
+    restrictPrivateFile(RT_LOG_PATH);
+  }
 }
 
 function pruneRadioTextLog(now = Date.now(), forceRewrite = false) {
   const cutoff = now - RT_LOG_RETENTION_MS;
   const previousLength = radioTextLogEntries.length;
   radioTextLogEntries = radioTextLogEntries.filter(entry => Date.parse(entry.timestamp) >= cutoff);
+  if (radioTextLogEntries.length > MAX_RT_LOG_ENTRIES) {
+    radioTextLogEntries = radioTextLogEntries.slice(-MAX_RT_LOG_ENTRIES);
+    logWarn(`[${PLUGIN_NAME}] RadioText log reached the safety entry cap; oldest retained entries were discarded.`);
+  }
   if (forceRewrite || radioTextLogEntries.length !== previousLength) rewriteRadioTextLog();
   lastRtLogPruneAt = now;
 }
@@ -542,7 +653,7 @@ function loadRadioTextLog() {
       rewriteRadioTextLog();
       return;
     }
-    radioTextLogEntries = fs.readFileSync(RT_LOG_PATH, 'utf8')
+    radioTextLogEntries = readRadioTextLogBounded()
       .split(/\r?\n/)
       .filter(Boolean)
       .map(line => {
@@ -606,13 +717,11 @@ function writeRadioTextSequenceState() {
   try {
     const dir = path.dirname(RT_SEQUENCE_STATE_PATH);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const tmpPath = `${RT_SEQUENCE_STATE_PATH}.tmp`;
     const body = {
       version: 1,
       sequences: Object.fromEntries(lastSettledRtBySequence)
     };
-    fs.writeFileSync(tmpPath, `${JSON.stringify(body, null, 2)}\n`, 'utf8');
-    fs.renameSync(tmpPath, RT_SEQUENCE_STATE_PATH);
+    writePrivateFileAtomic(RT_SEQUENCE_STATE_PATH, `${JSON.stringify(body, null, 2)}\n`);
   } catch (err) {
     logWarn(`[${PLUGIN_NAME}] RadioText sequence state could not be written: ${err.message}`);
   }
@@ -630,7 +739,8 @@ function rebuildRadioTextSequenceStateFromRetainedLog() {
 function loadRadioTextSequenceState() {
   try {
     if (fs.existsSync(RT_SEQUENCE_STATE_PATH)) {
-      const parsed = JSON.parse(fs.readFileSync(RT_SEQUENCE_STATE_PATH, 'utf8'));
+      const parsed = JSON.parse(readBoundedUtf8File(RT_SEQUENCE_STATE_PATH, MAX_RT_SEQUENCE_STATE_FILE_BYTES, 'RadioText sequence state'));
+      restrictPrivateFile(RT_SEQUENCE_STATE_PATH);
       if (isPlainObject(parsed) && isPlainObject(parsed.sequences)) {
         lastSettledRtBySequence = new Map();
         for (const [key, signature] of Object.entries(parsed.sequences)) {
@@ -674,11 +784,11 @@ function appendFinalRadioTextEntry(candidate) {
   };
 
   try {
-    fs.appendFileSync(RT_LOG_PATH, `${JSON.stringify(entry)}\n`, 'utf8');
+    appendPrivateUtf8File(RT_LOG_PATH, `${JSON.stringify(entry)}\n`);
     radioTextLogEntries.push(entry);
     rememberSettledRadioTextSequence(candidate.sequenceKey, candidate.signature);
     writeRadioTextSequenceState();
-    if (!lastRtLogPruneAt || Date.now() - lastRtLogPruneAt >= RT_LOG_CLEANUP_INTERVAL_MS) {
+    if (radioTextLogEntries.length > MAX_RT_LOG_ENTRIES || !lastRtLogPruneAt || Date.now() - lastRtLogPruneAt >= RT_LOG_CLEANUP_INTERVAL_MS) {
       pruneRadioTextLog(Date.now(), true);
     }
     sendPluginMessage('PushoverWatchdog:rtLogChanged', { latest: entry });
@@ -754,16 +864,25 @@ function radioTextLogPage(request = {}) {
   pruneRadioTextLog(Date.now(), false);
   const requestedLimit = Math.trunc(finiteNumber(request.limit, DEFAULT_RT_LOG_PAGE_SIZE));
   const limit = Math.max(1, Math.min(MAX_RT_LOG_PAGE_SIZE, requestedLimit));
-  const beforeMs = request.before ? Date.parse(String(request.before)) : Infinity;
-  const matching = radioTextLogEntries
-    .filter(entry => !Number.isFinite(beforeMs) || Date.parse(entry.timestamp) < beforeMs)
-    .slice()
-    .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
-  const entries = matching.slice(0, limit);
+  const parsedBefore = request.before ? Date.parse(String(request.before)) : Infinity;
+  const beforeMs = Number.isFinite(parsedBefore) ? parsedBefore : Infinity;
+  const entries = [];
+  let hasMore = false;
+  // Entries are maintained chronologically; walk backwards and stop as soon as
+  // the requested page is full rather than copying/sorting the complete history.
+  for (let index = radioTextLogEntries.length - 1; index >= 0; index -= 1) {
+    const entry = radioTextLogEntries[index];
+    if (Date.parse(entry.timestamp) >= beforeMs) continue;
+    if (entries.length < limit) entries.push(entry);
+    else {
+      hasMore = true;
+      break;
+    }
+  }
   return {
     entries,
     retentionDays: 7,
-    hasMore: matching.length > entries.length,
+    hasMore,
     nextBefore: entries.length ? entries[entries.length - 1].timestamp : null
   };
 }
@@ -812,7 +931,9 @@ function resetFrequencyStates() {
 
 function isSensitivePluginMessage(type) {
   return type === 'PushoverWatchdog:config' ||
+    type === 'PushoverWatchdog:status' ||
     type === 'PushoverWatchdog:toast' ||
+    type === 'PushoverWatchdog:rtLogPage' ||
     type === 'PushoverWatchdog:rtLogChanged';
 }
 
@@ -822,7 +943,7 @@ function sendPluginMessage(type, value) {
   const wss = pluginsApi.getPluginsWss();
   if (wss) {
     wss.clients.forEach(client => {
-      if (client.readyState === WebSocket.OPEN && (!sensitive || client.__pushoverWatchdogAuthenticated === true)) {
+      if (client.readyState === WebSocket.OPEN && (!sensitive || client.__pushoverWatchdogAdminAuthenticated === true)) {
         try { client.send(payload); } catch (_) {}
       }
     });
@@ -834,14 +955,14 @@ function sendPluginMessageTo(client, type, value) {
   try { client.send(JSON.stringify({ type, value })); } catch (_) {}
 }
 
-function isAuthenticatedWs(client) {
-  return client && client.__pushoverWatchdogAuthenticated === true;
+function isAdminAuthenticatedWs(client) {
+  return client && client.__pushoverWatchdogAdminAuthenticated === true;
 }
 
 function rejectUnauthenticated(client, action) {
   sendPluginMessageTo(client, 'PushoverWatchdog:toast', {
     level: 'error',
-    message: `Login required to ${action}.`
+    message: `Administrator login required to ${action}.`
   });
   logWarn(`[${PLUGIN_NAME}] Rejected unauthenticated plugin action: ${action}.`);
 }
@@ -999,6 +1120,18 @@ function isAllowedWebSocketOrigin(request) {
   }
 }
 
+const pluginClientMessageHandlers = new Map();
+
+function detachPluginClientMessageHandlers() {
+  for (const [client, handlers] of pluginClientMessageHandlers.entries()) {
+    try { client.off('message', handlers.message); } catch (_) {}
+    try { client.off('close', handlers.close); } catch (_) {}
+  }
+  pluginClientMessageHandlers.clear();
+}
+
+runtimeAddCleanup(detachPluginClientMessageHandlers);
+
 function registerPluginWebSocketAuthHandlers() {
   const wss = pluginsApi.getPluginsWss();
   if (!wss) {
@@ -1008,10 +1141,10 @@ function registerPluginWebSocketAuthHandlers() {
 
   const connectionHandler = (client, request) => {
     const originAllowed = isAllowedWebSocketOrigin(request);
-    client.__pushoverWatchdogAuthenticated = !!(originAllowed && (request.session?.isAdminAuthenticated || request.session?.isTuneAuthenticated));
+    client.__pushoverWatchdogAdminAuthenticated = !!(originAllowed && request.session?.isAdminAuthenticated);
     if (!originAllowed) logWarn(`[${PLUGIN_NAME}] Rejected plugin WebSocket actions due to invalid Origin header.`);
 
-    client.on('message', (message) => {
+    const messageHandler = (message) => {
       if (Buffer.byteLength(message) > MAX_PLUGIN_MESSAGE_BYTES) {
         logWarn(`[${PLUGIN_NAME}] Ignored oversized plugin WebSocket message.`);
         return;
@@ -1022,19 +1155,19 @@ function registerPluginWebSocketAuthHandlers() {
       if (!event.type.startsWith('PushoverWatchdog:')) return;
 
       if (event.type === 'PushoverWatchdog:getConfig') {
-        if (!isAuthenticatedWs(client)) return rejectUnauthenticated(client, 'view Pushover Watchdog settings');
+        if (!isAdminAuthenticatedWs(client)) return rejectUnauthenticated(client, 'view Pushover Watchdog settings');
         sendPluginMessageTo(client, 'PushoverWatchdog:config', sanitizedConfigForUi());
         return;
       }
 
       if (event.type === 'PushoverWatchdog:getRtLog') {
-        if (!isAuthenticatedWs(client)) return rejectUnauthenticated(client, 'view RadioText log');
+        if (!isAdminAuthenticatedWs(client)) return rejectUnauthenticated(client, 'view RadioText log');
         sendPluginMessageTo(client, 'PushoverWatchdog:rtLogPage', radioTextLogPage(isPlainObject(event.value) ? event.value : {}));
         return;
       }
 
       if (event.type === 'PushoverWatchdog:saveConfig') {
-        if (!isAuthenticatedWs(client)) return rejectUnauthenticated(client, 'save Pushover Watchdog settings');
+        if (!isAdminAuthenticatedWs(client)) return rejectUnauthenticated(client, 'save Pushover Watchdog settings');
         try {
           const saved = saveConfig(isPlainObject(event.value) ? event.value : {});
           sendPluginMessageTo(client, 'PushoverWatchdog:config', sanitizedConfigForUi(saved));
@@ -1047,14 +1180,18 @@ function registerPluginWebSocketAuthHandlers() {
       }
 
       if (event.type === 'PushoverWatchdog:test' || event.type === 'PushoverWatchdog:testChannel') {
-        if (!isAuthenticatedWs(client)) return rejectUnauthenticated(client, 'send FM Monitor test notifications');
+        if (!isAdminAuthenticatedWs(client)) return rejectUnauthenticated(client, 'send FM Monitor test notifications');
         const channel = event.type === 'PushoverWatchdog:test' ? 'pushover' : String(event.value?.channel || '').toLowerCase();
         sendTestNotification(channel)
           .then(() => sendPluginMessageTo(client, 'PushoverWatchdog:toast', { level: 'success', message: `${channelLabel(channel)} test notification sent.` }))
           .catch(err => sendPluginMessageTo(client, 'PushoverWatchdog:toast', { level: 'error', message: `${channelLabel(channel)} test failed: ${err.message}` }));
         return;
       }
-    });
+    };
+    const closeHandler = () => pluginClientMessageHandlers.delete(client);
+    pluginClientMessageHandlers.set(client, { message: messageHandler, close: closeHandler });
+    client.on('message', messageHandler);
+    client.once('close', closeHandler);
   };
 
   wss.on('connection', connectionHandler);
@@ -1062,15 +1199,19 @@ function registerPluginWebSocketAuthHandlers() {
     try { wss.off('connection', connectionHandler); } catch (_) {}
   });
 
-  logInfo(`[${PLUGIN_NAME}] Authenticated-only WebSocket protection enabled.`);
+  logInfo(`[${PLUGIN_NAME}] Administrator-only WebSocket protection enabled.`);
 }
 
 function sanitizedConfigForUi(cfg = config) {
-  return {
-    ...cfg,
-    pushoverUserKey: cfg.pushoverUserKey || '',
-    pushoverApiToken: cfg.pushoverApiToken || ''
-  };
+  const visible = { ...cfg };
+  // Credentials are never transmitted through /data_plugins; FM-DX broadcasts
+  // browser-originated plugin messages to other connected plugin clients.
+  delete visible.pushoverUserKey;
+  delete visible.pushoverApiToken;
+  delete visible.telegramBotToken;
+  visible.pushoverCredentialsConfigured = !!(cfg.pushoverUserKey && cfg.pushoverApiToken);
+  visible.telegramBotConfigured = !!cfg.telegramBotToken;
+  return visible;
 }
 
 function currentObservedFrequency() {
@@ -1224,12 +1365,14 @@ function currentStatusPayload() {
 
 function tick() {
   const now = Date.now();
-  attachAudioMonitor();
 
   if (!config.enabled) {
+    if (lastAudioStream || currentAudio.attached) detachAudioMonitor();
     sendPluginMessage('PushoverWatchdog:status', currentStatusPayload());
     return;
   }
+
+  attachAudioMonitor();
 
   if ((now - lastCheckAt) < Math.max(1, Number(config.checkIntervalSeconds || 2)) * 1000) return;
   lastCheckAt = now;
@@ -1341,6 +1484,9 @@ function updateStereoHistory(st, now, stereoOn, canCheckStereo) {
   const windowMs = Math.max(1, Number(config.stereoWindowSeconds || 60)) * 1000;
   st.stereoHistory.push({ t: now, on: !!stereoOn });
   st.stereoHistory = st.stereoHistory.filter(sample => now - sample.t <= windowMs);
+  if (st.stereoHistory.length > MAX_STEREO_HISTORY_SAMPLES) {
+    st.stereoHistory = st.stereoHistory.slice(-MAX_STEREO_HISTORY_SAMPLES);
+  }
 
   let drops = 0;
   let offSamples = 0;
@@ -1558,8 +1704,14 @@ function truncateText(value, maxChars) {
 
 function sendPushover(title, message, kind) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error); else resolve(value);
+    };
     if (!config.pushoverUserKey || !config.pushoverApiToken) {
-      reject(new Error('Pushover User Key or API Token is missing.'));
+      finish(new Error('Pushover User Key or API Token is missing.'));
       return;
     }
 
@@ -1597,12 +1749,14 @@ function sendPushover(title, message, kind) {
         }
       });
       res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) resolve(response);
-        else reject(new Error(`HTTP ${res.statusCode}: ${truncateText(response, 512)}`));
+        if (res.statusCode >= 200 && res.statusCode < 300) finish(null, response);
+        else finish(new Error(`HTTP ${res.statusCode}: ${truncateText(response, 512)}`));
       });
+      res.on('aborted', () => finish(new Error('Pushover response was aborted before completion.')));
+      res.on('error', err => finish(err));
     });
     req.on('timeout', () => req.destroy(new Error('Pushover request timeout')));
-    req.on('error', reject);
+    req.on('error', err => finish(err));
     req.write(body);
     req.end();
   });
@@ -1610,12 +1764,18 @@ function sendPushover(title, message, kind) {
 
 function sendTelegram(title, message, kind) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error); else resolve(value);
+    };
     if (!config.telegramBotToken || !config.telegramChatId) {
-      reject(new Error('Telegram Bot Token or Chat ID is missing.'));
+      finish(new Error('Telegram Bot Token or Chat ID is missing.'));
       return;
     }
     if (!/^[0-9]+:[A-Za-z0-9_-]+$/.test(config.telegramBotToken)) {
-      reject(new Error('Telegram Bot Token format is invalid.'));
+      finish(new Error('Telegram Bot Token format is invalid.'));
       return;
     }
 
@@ -1643,12 +1803,14 @@ function sendTelegram(title, message, kind) {
         if (responseBytes <= MAX_NOTIFICATION_RESPONSE_BYTES) response += chunk.toString();
       });
       res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) resolve(response);
-        else reject(new Error(`HTTP ${res.statusCode}: ${truncateText(response, 512)}`));
+        if (res.statusCode >= 200 && res.statusCode < 300) finish(null, response);
+        else finish(new Error(`HTTP ${res.statusCode}: ${truncateText(response, 512)}`));
       });
+      res.on('aborted', () => finish(new Error('Telegram response was aborted before completion.')));
+      res.on('error', err => finish(err));
     });
     req.on('timeout', () => req.destroy(new Error('Telegram request timeout')));
-    req.on('error', reject);
+    req.on('error', err => finish(err));
     req.write(body);
     req.end();
   });
@@ -1727,6 +1889,9 @@ function sendZabbix(title, message, kind, freq) {
     });
     socket.on('timeout', () => finish(new Error('Zabbix connection timeout')));
     socket.on('error', err => finish(err));
+    socket.on('close', () => {
+      if (!settled) finish(new Error('Zabbix connection closed before a complete response.'));
+    });
   });
 }
 

@@ -8,7 +8,9 @@
   const runtime = {
     timers: new Set(),
     observers: new Set(),
+    stopped: false,
     stop() {
+      this.stopped = true;
       for (const timer of this.timers) {
         try { clearTimeout(timer); clearInterval(timer); } catch (_) {}
       }
@@ -17,23 +19,33 @@
         try { observer.disconnect(); } catch (_) {}
       }
       this.observers.clear();
+      try { document.removeEventListener('DOMContentLoaded', boot); } catch (_) {}
       try { if (ws) ws.close(); } catch (_) {}
       ws = null;
+      // Drop DOM nodes carrying handlers from an older hot-loaded copy.
+      ['pushover-watchdog-button', 'pushover-watchdog-rtlog-button', 'pushover-watchdog-modal', 'pushover-watchdog-rtlog-modal'].forEach(id => {
+        const node = document.getElementById(id);
+        if (node) node.remove();
+      });
     }
   };
   window[runtimeKey] = runtime;
 
   function runtimeSetTimeout(fn, delay) {
+    if (runtime.stopped) return null;
     const timer = setTimeout(() => {
       runtime.timers.delete(timer);
-      fn();
+      if (!runtime.stopped) fn();
     }, delay);
     runtime.timers.add(timer);
     return timer;
   }
 
   function runtimeSetInterval(fn, delay) {
-    const timer = setInterval(fn, delay);
+    if (runtime.stopped) return null;
+    const timer = setInterval(() => {
+      if (!runtime.stopped) fn();
+    }, delay);
     runtime.timers.add(timer);
     return timer;
   }
@@ -62,21 +74,18 @@
     return `${protocol}//${window.location.host}${window.location.pathname}data_plugins`;
   }
 
-  function isAuthenticated() {
+  function isAdminAuthenticated() {
     const bodyText = document.body ? (document.body.textContent || document.body.innerText || '') : '';
 
-    // FM-DX Webserver v1.4.x exposes the login state in the side panel text,
-    // but depending on theme/plugin load order that text may not be available
-    // at the exact moment this plugin starts. The dashboard/logout elements are
-    // reliable additional indicators that a user is logged in.
+    // Settings contain alert destinations and operational information. Keep this
+    // panel aligned with the backend: administrator sessions only, not tune-only users.
     return bodyText.includes('You are logged in as an administrator.') ||
       bodyText.includes('You are logged in as an adminstrator.') ||
-      bodyText.includes('You are logged in and can control the receiver.') ||
-      !!document.querySelector('.logout-link, #dashboard-lock-admin, #dashboard-lock-tune');
+      !!document.querySelector('#dashboard-lock-admin');
   }
 
   function connect() {
-    if (!isAuthenticated()) return;
+    if (runtime.stopped || !isAdminAuthenticated()) return;
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
     if (wsReconnectTimer) {
       runtimeClearTimer(wsReconnectTimer);
@@ -113,6 +122,7 @@
     });
     ws.addEventListener('close', () => {
       ws = null;
+      if (runtime.stopped) return;
       if (!wsReconnectTimer) {
         wsReconnectTimer = runtimeSetTimeout(() => {
           wsReconnectTimer = null;
@@ -147,6 +157,16 @@
         <input id="${id}" type="${type}" value="${escapeHtml(value ?? '')}">
         ${help ? `<small>${help}</small>` : ''}
       </label>`;
+  }
+
+  function protectedSecretField(label, configured, configKeys) {
+    const state = configured ? 'Configured on server' : 'Not configured';
+    return `
+      <div class="pwd-field">
+        <span>${label}</span>
+        <div class="pwd-secret-status">${escapeHtml(state)}</div>
+        <small>For security, edit <code>plugins_configs/PushoverWatchdog.json</code> directly (${escapeHtml(configKeys)}). Secrets are not sent through the plugin WebSocket.</small>
+      </div>`;
   }
 
   function checkbox(id, label, value) {
@@ -263,8 +283,7 @@
 
         <h3>Pushover</h3>
         <div class="pwd-grid">
-          ${field('pwd-user', 'User Key', config.pushoverUserKey)}
-          ${field('pwd-token', 'API Token', config.pushoverApiToken)}
+          ${protectedSecretField('User Key + API Token', config.pushoverCredentialsConfigured, 'pushoverUserKey / pushoverApiToken')}
           ${field('pwd-device', 'Device (optional)', config.pushoverDevice)}
           ${field('pwd-sound', 'Sound', config.pushoverSound)}
           ${field('pwd-priority', 'Priority', config.pushoverPriority, 'number', 'Use 2 only for Emergency alerts; retry and expire are required then.')}
@@ -275,7 +294,7 @@
 
         <h3>Telegram Bot</h3>
         <div class="pwd-grid">
-          ${field('pwd-telegram-token', 'Bot token', config.telegramBotToken, 'password', 'Create the bot with BotFather and provide its HTTP API token.')}
+          ${protectedSecretField('Bot token', config.telegramBotConfigured, 'telegramBotToken')}
           ${field('pwd-telegram-chat', 'Chat ID', config.telegramChatId, 'text', 'User, group or channel chat ID where alerts will be sent.')}
           ${field('pwd-telegram-thread', 'Topic / message thread ID (optional)', config.telegramThreadId, 'text', 'Use only for a Telegram forum topic.')}
         </div>
@@ -346,8 +365,8 @@
       const button = document.getElementById(`pwd-test-${channel}`);
       if (button) {
         button.onclick = () => {
-          if (!isAuthenticated()) {
-            toast('error', 'You must be logged in to send test notifications.');
+          if (!isAdminAuthenticated()) {
+            toast('error', 'You must be logged in as an administrator to send test notifications.');
             return;
           }
           send('PushoverWatchdog:testChannel', { channel });
@@ -377,8 +396,8 @@
   }
 
   function saveFromUi() {
-    if (!isAuthenticated()) {
-      toast('error', 'You must be logged in to edit FM Monitor settings.');
+    if (!isAdminAuthenticated()) {
+      toast('error', 'You must be logged in as an administrator to edit FM Monitor settings.');
       return;
     }
     const frequencies = document.getElementById('pwd-frequencies').value
@@ -387,15 +406,12 @@
     const next = {
       enabled: document.getElementById('pwd-enabled').checked,
       pushoverEnabled: document.getElementById('pwd-pushover-enabled').checked,
-      pushoverUserKey: document.getElementById('pwd-user').value.trim(),
-      pushoverApiToken: document.getElementById('pwd-token').value.trim(),
       pushoverDevice: document.getElementById('pwd-device').value.trim(),
       pushoverSound: document.getElementById('pwd-sound').value.trim(),
       pushoverPriority: readNum('pwd-priority', 0),
       pushoverRetrySeconds: readNum('pwd-retry', 60),
       pushoverExpireSeconds: readNum('pwd-expire', 1800),
       telegramEnabled: document.getElementById('pwd-telegram-enabled').checked,
-      telegramBotToken: document.getElementById('pwd-telegram-token').value.trim(),
       telegramChatId: document.getElementById('pwd-telegram-chat').value.trim(),
       telegramThreadId: document.getElementById('pwd-telegram-thread').value.trim(),
       zabbixEnabled: document.getElementById('pwd-zabbix-enabled').checked,
@@ -487,7 +503,7 @@
   }
 
   function requestRtLog(reset) {
-    if (!isAuthenticated()) return;
+    if (!isAdminAuthenticated()) return;
     if (reset) {
       rtLogEntries = [];
       rtLogBefore = null;
@@ -510,8 +526,8 @@
   }
 
   function openRtLogModal() {
-    if (!isAuthenticated()) {
-      toast('error', 'You must be logged in to view the RadioText log.');
+    if (!isAdminAuthenticated()) {
+      toast('error', 'You must be logged in as an administrator to view the RadioText log.');
       return;
     }
     const modal = ensureRtLogModal();
@@ -525,8 +541,8 @@
   }
 
   function openModal() {
-    if (!isAuthenticated()) {
-      toast('error', 'You must be logged in to open FM Monitor settings.');
+    if (!isAdminAuthenticated()) {
+      toast('error', 'You must be logged in as an administrator to open FM Monitor settings.');
       return;
     }
     send('PushoverWatchdog:getConfig', {});
@@ -564,6 +580,8 @@
       .pwd-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:12px;}
       .pwd-field{display:flex;flex-direction:column;gap:5px;font-size:13px;}
       .pwd-field input,.pwd-field textarea,.pwd-field select{width:100%;box-sizing:border-box;border:1px solid var(--color-2,#444);background:var(--color-0,#0f0f0f);color:var(--color-main-bright,#fff);border-radius:8px;padding:8px;font:inherit;}
+      .pwd-secret-status{border:1px solid var(--color-2,#444);background:var(--color-0,#0f0f0f);border-radius:8px;padding:8px;font:inherit;opacity:.9;}
+      .pwd-field code{font-size:12px;}
       .pwd-field small{opacity:.65;line-height:1.35;}
       .pwd-wide{margin-bottom:12px;}
       .pwd-check{display:flex;align-items:center;gap:8px;background:var(--color-2-transparent,rgba(255,255,255,.06));border-radius:8px;padding:8px;font-size:13px;}
@@ -629,7 +647,7 @@
   }
 
   function addButton() {
-    if (!isAuthenticated()) {
+    if (!isAdminAuthenticated()) {
       removeButtons();
       return;
     }
@@ -639,9 +657,31 @@
 
   let started = false;
 
+  function deactivateAdminUi() {
+    if (wsReconnectTimer) {
+      runtimeClearTimer(wsReconnectTimer);
+      wsReconnectTimer = null;
+    }
+    try { if (ws) ws.close(); } catch (_) {}
+    ws = null;
+    config = null;
+    status = null;
+    rtLogEntries = [];
+    rtLogHasMore = false;
+    rtLogBefore = null;
+    rtLogAppendNext = false;
+    ['pushover-watchdog-modal', 'pushover-watchdog-rtlog-modal'].forEach(id => {
+      const node = document.getElementById(id);
+      if (node) node.remove();
+    });
+    removeButtons();
+    started = false;
+  }
+
   function startWhenAuthenticated() {
-    if (!isAuthenticated()) {
-      removeButtons();
+    if (!isAdminAuthenticated()) {
+      if (started || ws) deactivateAdminUi();
+      else removeButtons();
       return;
     }
 
@@ -649,20 +689,21 @@
       started = true;
       injectCss();
       renderModal();
-      connect();
     }
-
+    connect();
     addButton();
   }
 
   function boot() {
+    if (runtime.stopped) return;
     startWhenAuthenticated();
 
     // Some FM-DX elements are injected after plugin scripts run. Keep checking
     // briefly and also react to DOM changes, so the button appears as soon as
     // the logged-in dashboard is present.
-    const interval = runtimeSetInterval(startWhenAuthenticated, 1000);
-    runtimeSetTimeout(() => runtimeClearTimer(interval), 30000);
+    // Keep one lightweight guard active for the page lifetime so an ordinary
+    // administrator logout closes this plugin's UI/WebSocket promptly.
+    runtimeSetInterval(startWhenAuthenticated, 2000);
 
     if (document.body && typeof MutationObserver !== 'undefined') {
       const observer = new MutationObserver(startWhenAuthenticated);
