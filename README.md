@@ -2,7 +2,7 @@
 
 **PushoverWatchdog FM-DX** is a plugin for **FM-DX Webserver** that monitors a selected FM frequency and sends alerts through **Pushover** when reception, modulation, RDS or stereo indicator problems are detected.
 
-Created **by Play Radio Constanta**.
+Created **by Dragos Ilie initially for Play Radio Constanța**.
 
 The plugin is designed for FM monitoring setups using TEF / Headless TEF receivers and FM-DX Webserver.
 
@@ -31,16 +31,7 @@ To use this plugin, you need:
 
 - A compatible **FM-DX Webserver** installation
 - A working **TEF / Headless TEF** receiver
-- Internet access for Pushover notifications
-- A **Pushover account**
-- Your Pushover **User Key**
-- A Pushover **Application/API Token**
-
-Useful Pushover links:
-
-- Pushover official website: https://pushover.net/
-- Create Application/API Token: https://pushover.net/apps/build
-- Pushover API documentation: https://pushover.net/api
+- Internet access for notifications
 
 ---
 
@@ -67,7 +58,7 @@ After restart, log in to the web interface and open:
 FM Monitor
 ```
 
-Use this panel to configure your Pushover credentials and monitoring settings.
+Use this panel to configure your notifications and monitoring settings.
 
 ---
 
@@ -77,112 +68,6 @@ The plugin creates and reads this configuration file:
 
 ```text
 plugins_configs/PushoverWatchdog.json
-```
-
----
-
-## Pushover Setup
-
-In your Pushover account, copy your **User Key** from the main dashboard.
-
-Then create an application/API token here:
-
-```text
-https://pushover.net/apps/build
-```
-
-Basic Pushover configuration:
-
-```json
-{
-  "pushoverUserKey": "YOUR_USER_KEY",
-  "pushoverApiToken": "YOUR_API_TOKEN",
-  "pushoverDevice": "",
-  "pushoverPriority": 1
-}
-```
-
-`pushoverDevice` can be left empty.
-
-If empty, Pushover sends notifications to all active devices linked to your account.
-
----
-
-## Pushover Priority
-
-Supported priority values:
-
-| Value | Meaning |
-|---:|---|
-| `-2` | Lowest priority / silent |
-| `-1` | Low priority |
-| `0` | Normal priority |
-| `1` | High priority |
-| `2` | Emergency priority |
-
-Recommended value:
-
-```json
-"pushoverPriority": 1
-```
-
-For emergency priority, Pushover requires both `retry` and `expire`:
-
-```json
-{
-  "pushoverPriority": 2,
-  "pushoverRetrySeconds": 60,
-  "pushoverExpireSeconds": 1800
-}
-```
-
-With this example, Pushover repeats the emergency alert every 60 seconds for up to 1800 seconds, unless it is acknowledged.
-
----
-
-## Recommended Starting Configuration
-
-```json
-{
-  "frequencies": [91.6],
-  "checkIntervalSeconds": 2,
-  "tuneSettleSeconds": 4,
-  "dwellSeconds": 30,
-  "forceRetuneSeconds": 300,
-
-  "signalUnit": "dbuv",
-  "signalThreshold": 30,
-  "noCarrierSeconds": 20,
-
-  "blankSeconds": 30,
-  "audioSilenceThresholdDbfs": -45,
-  "requireCarrierForBlank": true,
-
-  "rdsMissingSeconds": 30,
-  "requireCarrierForRds": true,
-
-  "stereoMonitorEnabled": true,
-  "stereoWindowSeconds": 60,
-  "stereoMinDrops": 3,
-  "stereoMinOffSamples": 2,
-  "stereoRequireCarrier": true,
-  "stereoRequireAudio": true,
-  "stereoRequireRdsValid": false,
-  "stereoRecoverySeconds": 30,
-
-  "recoverySeconds": 10,
-  "alertCooldownMinutes": 10,
-  "sendRecoveryNotifications": true,
-  "includeRdsInfo": true,
-  "debugLogging": false,
-
-  "pushoverUserKey": "YOUR_USER_KEY",
-  "pushoverApiToken": "YOUR_API_TOKEN",
-  "pushoverDevice": "",
-  "pushoverPriority": 1,
-  "pushoverRetrySeconds": 60,
-  "pushoverExpireSeconds": 1800
-}
 ```
 
 ---
@@ -372,6 +257,12 @@ Stereo indicator dropped 3 times in the last 60 seconds.
 
 ---
 
+### Stereo instability alerts during manual testing
+
+The plugin monitors the stereo indicator reported by FM-DX Webserver. If manual changes cause repeated stereo on/off transitions, an alert may be triggered.
+
+---
+
 ## Recovery Notifications
 
 If enabled, the plugin sends a notification when a previously detected issue returns to normal.
@@ -426,56 +317,5 @@ PI: ?
 RDS lock: yes
 RDS valid: no
 ```
-
----
-
-## Troubleshooting
-
-### The FM Monitor button does not appear
-
-Make sure you are logged in to FM-DX Webserver.
-
-Then refresh the browser cache using a hard refresh, for example:
-
-```text
-Ctrl + F5
-```
-
-### No Pushover notifications are received
-
-Check that:
-
-- `pushoverUserKey` is correct
-- `pushoverApiToken` is correct
-- The server has internet access
-- `pushoverDevice` is either empty or matches a real Pushover device name
-
-### Emergency priority fails
-
-If using priority `2`, make sure these values are present:
-
-```json
-{
-  "pushoverPriority": 2,
-  "pushoverRetrySeconds": 60,
-  "pushoverExpireSeconds": 1800
-}
-```
-
-### False signal alerts
-
-Lower `signalThreshold` or calibrate it according to the normal signal level of the monitored station.
-
-### False blank alerts
-
-Lower the silence threshold, for example:
-
-```json
-"audioSilenceThresholdDbfs": -50
-```
-
-### Stereo instability alerts during manual testing
-
-The plugin monitors the stereo indicator reported by FM-DX Webserver. If manual changes cause repeated stereo on/off transitions, an alert may be triggered.
 
 ---
