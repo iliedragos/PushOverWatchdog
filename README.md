@@ -314,7 +314,7 @@ Signal: 24.7 dBµV
 Signal threshold: 30.0 dBµV
 Audio: -18.3 dBFS
 PI: ?
-RDS lock: yes
+RDS lock: ?
 RDS valid: no
 ```
 
