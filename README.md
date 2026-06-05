@@ -72,6 +72,14 @@ plugins_configs/PushoverWatchdog.json
 
 ---
 
+## Documentation
+
+Additional setup guides are available in the project Wiki:
+
+* [Notification integrations: Pushover, Telegram and Zabbix](https://github.com/iliedragos/PushOverWatchdog/wiki/How-to-create-notifications-for-Pushover,-Telegram-&-Zabbix)
+
+---
+
 ## How It Works
 
 The plugin periodically checks the currently tuned frequency and evaluates:
@@ -314,18 +322,11 @@ Unauthenticated users cannot:
 
 ---
 
-## Example Notification
+## Example Notifications from Pushover
 
-```text
-FM Monitor: Signal below threshold / white noise
-
-Frequency: 91.600 MHz
-Signal: 24.7 dBµV
-Signal threshold: 30.0 dBµV
-Audio: -18.3 dBFS
-PI: ?
-RDS lock: ?
-RDS valid: no
-```
+<img width="540" height="441" alt="white noise" src="https://github.com/user-attachments/assets/0ae1af83-c189-4e5b-be82-b8dc0f44371f" />
+<img width="540" height="1141" alt="stereo" src="https://github.com/user-attachments/assets/3d75cc36-540b-4f30-b602-68eedd508117" />
+<img width="540" height="1467" alt="RDS+modulation" src="https://github.com/user-attachments/assets/2f203784-fd71-4891-9496-57fedfd3978e" />
+<img width="540" height="395" alt="blank" src="https://github.com/user-attachments/assets/eb6382f6-1bae-46da-b80e-144a86d674f7" />
 
 ---
