@@ -1,8 +1,8 @@
 # PushoverWatchdog FM-DX
 
-**PushoverWatchdog FM-DX** is a plugin for **FM-DX Webserver** that monitors a selected FM frequency and sends alerts through **Pushover** when reception, modulation, RDS or stereo indicator problems are detected.
+**PushoverWatchdog FM-DX** is a plugin for **FM-DX Webserver** that monitors a selected FM frequency and sends alerts through **Pushover**, **Telegram** & **Zabbix** when reception, modulation, RDS or stereo indicator problems are detected.
 
-Created **by Dragos Ilie initially for Play Radio Constanța**.
+Created by **Dragos Ilie, initially for monitoring FM frequency of Play Radio in Constanța**.
 
 The plugin is designed for FM monitoring setups using TEF / Headless TEF receivers and FM-DX Webserver.
 
