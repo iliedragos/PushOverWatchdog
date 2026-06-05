@@ -19,6 +19,7 @@
 - Reduced RadioText history paging memory/CPU overhead by reading requested pages backwards from the already ordered in-memory retention list instead of copying and sorting the full retained history.
 - Detached live audio analysis while monitoring is disabled and completed missing abort/close handling for Pushover, Telegram and Zabbix requests, preventing avoidable retained resources on interrupted deliveries.
 - Added a browser-side admin-session guard that closes the plugin WebSocket and clears the admin UI when the current page is no longer authenticated as administrator.
+- Fixed a GitHub CodeQL client-side XSS alert in the live status renderer by replacing dynamic `innerHTML` rendering with DOM text nodes, and rendered RadioText log rows with `textContent` as additional defense-in-depth.
 
 ## 2026-05-26 - Signal conversion offset fix
 
