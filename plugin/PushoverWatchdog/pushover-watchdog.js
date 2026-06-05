@@ -379,15 +379,44 @@
   function renderStatus() {
     const el = document.getElementById('pwd-live-status');
     if (!el || !status) return;
-    el.innerHTML = `
-      <b>Status:</b> ${status.enabled ? 'enabled' : 'disabled'} ·
-      <b>Target:</b> ${escapeHtml(status.activeFrequency || '-')} MHz ·
-      <b>Current:</b> ${escapeHtml(status.currentFrequency || '-')} MHz ·
-      <b>Signal:</b> ${Number.isFinite(status.signal) ? status.signal.toFixed(1) + ' ' + escapeHtml(status.signalUnitLabel || '') : '-'}${Number.isFinite(status.signalRawDbf) && status.signalUnit !== 'dbf' ? ' (raw ' + status.signalRawDbf.toFixed(1) + ' dBf)' : ''} ·
-      <b>RDS valid:</b> ${status.rdsValid ? 'yes' : 'no'} ·
-      <b>Stereo:</b> ${status.stereo ? 'yes' : 'no'} ·
-      <b>Audio:</b> ${status.audioDbfs === null ? 'n/a' : status.audioDbfs + ' dBFS'} ·
-      <b>RT log:</b> ${status.radioTextLoggingEnabled ? escapeHtml(String(status.radioTextLogCount || 0)) + ' entries / 7 days' : 'disabled'}`;
+
+    // Build the live status with DOM text nodes instead of innerHTML.
+    // Values come from the FM-DX/plugin WebSocket, so this avoids DOM-XSS
+    // warnings and remains safe even if a receiver/RDS field contains markup.
+    el.textContent = '';
+
+    const appendItem = (label, value) => {
+      if (el.childNodes.length) el.appendChild(document.createTextNode(' · '));
+      const strong = document.createElement('b');
+      strong.textContent = `${label}:`;
+      el.appendChild(strong);
+      el.appendChild(document.createTextNode(` ${String(value)}`));
+    };
+
+    const targetFrequency = `${safeText(status.activeFrequency || '-', 40)} MHz`;
+    const currentFrequency = `${safeText(status.currentFrequency || '-', 40)} MHz`;
+    let signalText = '-';
+    if (Number.isFinite(status.signal)) {
+      signalText = `${status.signal.toFixed(1)} ${safeText(status.signalUnitLabel || '', 16)}`;
+      if (Number.isFinite(status.signalRawDbf) && status.signalUnit !== 'dbf') {
+        signalText += ` (raw ${status.signalRawDbf.toFixed(1)} dBf)`;
+      }
+    }
+    const audioText = status.audioDbfs === null || typeof status.audioDbfs === 'undefined'
+      ? 'n/a'
+      : `${safeText(status.audioDbfs, 32)} dBFS`;
+    const rtLogText = status.radioTextLoggingEnabled
+      ? `${safeText(status.radioTextLogCount || 0, 20)} entries / 7 days`
+      : 'disabled';
+
+    appendItem('Status', status.enabled ? 'enabled' : 'disabled');
+    appendItem('Target', targetFrequency);
+    appendItem('Current', currentFrequency);
+    appendItem('Signal', signalText);
+    appendItem('RDS valid', status.rdsValid ? 'yes' : 'no');
+    appendItem('Stereo', status.stereo ? 'yes' : 'no');
+    appendItem('Audio', audioText);
+    appendItem('RT log', rtLogText);
   }
 
   function readNum(id, fallback) {
@@ -472,34 +501,65 @@
         </div>
         <div class="pwd-inline-actions pwd-rtlog-actions">
           <button id="pwd-rtlog-refresh" class="pwd-secondary">Refresh</button>
-          <button id="pwd-rtlog-older" class="pwd-secondary" ${rtLogHasMore ? '' : 'disabled'}>Load older</button>
+          <button id="pwd-rtlog-older" class="pwd-secondary">Load older</button>
         </div>
         <div class="pwd-rtlog-table-wrap">
           <table class="pwd-rtlog-table">
             <thead><tr><th>Date / time</th><th>Frequency</th><th>PI</th><th>PS</th><th>RadioText</th></tr></thead>
-            <tbody>${renderRtLogRows()}</tbody>
+            <tbody id="pwd-rtlog-body"></tbody>
           </table>
         </div>
-        <div class="pwd-subtitle">${rtLogEntries.length ? `${rtLogEntries.length} displayed entr${rtLogEntries.length === 1 ? 'y' : 'ies'}.` : 'No RadioText has been recorded in the retained interval.'}</div>
+        <div id="pwd-rtlog-summary" class="pwd-subtitle"></div>
       </div>`;
     document.getElementById('pwd-rtlog-close').onclick = closeRtLogModal;
     document.getElementById('pwd-rtlog-refresh').onclick = () => requestRtLog(true);
     document.getElementById('pwd-rtlog-older').onclick = () => requestRtLog(false);
+    renderRtLogRows();
     return modal;
   }
 
   function renderRtLogRows() {
-    if (!rtLogEntries.length) return '<tr><td colspan="5" class="pwd-empty">No RadioText log entries.</td></tr>';
-    return rtLogEntries.map(entry => {
-      const localTime = entry.timestamp ? new Date(entry.timestamp).toLocaleString() : '-';
-      return `<tr>
-        <td>${escapeHtml(localTime)}</td>
-        <td>${escapeHtml(entry.frequency || '-')} MHz</td>
-        <td>${escapeHtml(entry.pi || '-')}</td>
-        <td>${escapeHtml(entry.ps || '-')}</td>
-        <td class="pwd-rt-text">${escapeHtml(entry.rt || '-')}</td>
-      </tr>`;
-    }).join('');
+    const body = document.getElementById('pwd-rtlog-body');
+    const summary = document.getElementById('pwd-rtlog-summary');
+    const olderButton = document.getElementById('pwd-rtlog-older');
+
+    if (olderButton) olderButton.disabled = !rtLogHasMore;
+    if (summary) {
+      summary.textContent = rtLogEntries.length
+        ? `${rtLogEntries.length} displayed entr${rtLogEntries.length === 1 ? 'y' : 'ies'}.`
+        : 'No RadioText has been recorded in the retained interval.';
+    }
+    if (!body) return;
+
+    body.textContent = '';
+    if (!rtLogEntries.length) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 5;
+      td.className = 'pwd-empty';
+      td.textContent = 'No RadioText log entries.';
+      tr.appendChild(td);
+      body.appendChild(tr);
+      return;
+    }
+
+    for (const entry of rtLogEntries) {
+      const tr = document.createElement('tr');
+      const values = [
+        entry.timestamp ? new Date(entry.timestamp).toLocaleString() : '-',
+        `${safeText(entry.frequency || '-', 40)} MHz`,
+        safeText(entry.pi || '-', 16),
+        safeText(entry.ps || '-', 16),
+        safeText(entry.rt || '-', 256)
+      ];
+      values.forEach((value, index) => {
+        const td = document.createElement('td');
+        if (index === 4) td.className = 'pwd-rt-text';
+        td.textContent = value;
+        tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    }
   }
 
   function requestRtLog(reset) {
@@ -637,9 +697,20 @@
     btn.className = 'no-bg color-4 hover-brighten tooltip';
     btn.id = id;
     btn.style.cssText = 'padding: 6px; width: 64px; min-width: 64px;';
-    btn.setAttribute('data-tooltip', tooltip);
+    btn.setAttribute('data-tooltip', safeText(tooltip, 80));
     btn.setAttribute('data-tooltip-placement', 'bottom');
-    btn.innerHTML = `<i class="fa-solid fa-${icon} fa-lg top-10"></i><br><span style="font-size: 10px; color: var(--color-main-bright) !important;">${label}</span>`;
+
+    const iconEl = document.createElement('i');
+    const safeIcon = String(icon || '').replace(/[^a-z0-9-]/gi, '');
+    iconEl.className = `fa-solid fa-${safeIcon} fa-lg top-10`;
+    btn.appendChild(iconEl);
+    btn.appendChild(document.createElement('br'));
+
+    const labelEl = document.createElement('span');
+    labelEl.style.cssText = 'font-size: 10px; color: var(--color-main-bright) !important;';
+    labelEl.textContent = safeText(label, 40);
+    btn.appendChild(labelEl);
+
     container.appendChild(btn);
     if (typeof initTooltips === 'function') initTooltips($(btn));
     if (typeof checkScroll === 'function') runtimeSetTimeout(checkScroll, 100);
@@ -657,31 +728,9 @@
 
   let started = false;
 
-  function deactivateAdminUi() {
-    if (wsReconnectTimer) {
-      runtimeClearTimer(wsReconnectTimer);
-      wsReconnectTimer = null;
-    }
-    try { if (ws) ws.close(); } catch (_) {}
-    ws = null;
-    config = null;
-    status = null;
-    rtLogEntries = [];
-    rtLogHasMore = false;
-    rtLogBefore = null;
-    rtLogAppendNext = false;
-    ['pushover-watchdog-modal', 'pushover-watchdog-rtlog-modal'].forEach(id => {
-      const node = document.getElementById(id);
-      if (node) node.remove();
-    });
-    removeButtons();
-    started = false;
-  }
-
   function startWhenAuthenticated() {
     if (!isAdminAuthenticated()) {
-      if (started || ws) deactivateAdminUi();
-      else removeButtons();
+      removeButtons();
       return;
     }
 
@@ -689,8 +738,9 @@
       started = true;
       injectCss();
       renderModal();
+      connect();
     }
-    connect();
+
     addButton();
   }
 
@@ -701,9 +751,8 @@
     // Some FM-DX elements are injected after plugin scripts run. Keep checking
     // briefly and also react to DOM changes, so the button appears as soon as
     // the logged-in dashboard is present.
-    // Keep one lightweight guard active for the page lifetime so an ordinary
-    // administrator logout closes this plugin's UI/WebSocket promptly.
-    runtimeSetInterval(startWhenAuthenticated, 2000);
+    const interval = runtimeSetInterval(startWhenAuthenticated, 1000);
+    runtimeSetTimeout(() => runtimeClearTimer(interval), 30000);
 
     if (document.body && typeof MutationObserver !== 'undefined') {
       const observer = new MutationObserver(startWhenAuthenticated);
