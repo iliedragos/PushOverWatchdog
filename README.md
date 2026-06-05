@@ -289,6 +289,16 @@ A restart is only required after replacing or updating the plugin files.
 
 ---
 
+## RadioText logging
+
+Pushover Watchdog can keep a rolling RadioText history directly inside the FM-DX Webserver admin interface. When enabled, the plugin stores only stable, fully received RadioText messages, avoiding partial RDS text while it is still loading.
+
+The log is available from a dedicated **RadioText log** button in the admin panel and keeps the most recent 7 days of entries. Older entries are removed automatically, so the log remains lightweight while still providing a useful recent history.
+
+RadioText A/B sequences are tracked separately, which prevents repetitive entries when the same promo text or song title is broadcast repeatedly. A new log entry is created only when a stable RadioText sequence actually changes.
+
+---
+
 ## Security Notes
 
 The configuration panel is available only for authenticated users.
