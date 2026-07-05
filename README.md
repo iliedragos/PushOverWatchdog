@@ -13,6 +13,7 @@ The plugin is designed for FM monitoring setups using TEF / Headless TEF receive
 - Signal below threshold / white noise detection
 - Blank audio / no modulation detection
 - Missing valid RDS detection
+- Sudden RDS group-stream loss detection (optional)
 - Stereo indicator instability detection
 - Recovery notifications
 - Pushover, Telegram & Zabbix alert integration
@@ -231,6 +232,24 @@ Example:
 ```
 
 This means the plugin sends an alert if no valid PI or PS is detected for 30 seconds while the signal is above the configured threshold.
+
+---
+
+### RDS Group Stream Loss
+
+This optional monitor watches the raw RDS group stream exposed by FM-DX Webserver’s local `/rds` WebSocket. It is designed for the case where PI/PS may remain visible for a while, but useful RDS groups have abruptly stopped arriving or decoding.
+
+The monitor is deliberately conservative: it first waits for three usable groups on the currently monitored frequency, then alerts only when no further usable group arrives for the configured period. A usable group must contain a valid **block B**, because that block identifies the RDS group type/version such as `0A`, `2A` or `15A`.
+
+```json
+{
+  "rdsGroupMonitoringEnabled": true,
+  "rdsGroupMissingSeconds": 10,
+  "rdsGroupRequireCarrier": true
+}
+```
+
+The default of 10 seconds is intended to catch a real interruption without reacting to a short decode glitch. The plugin does not treat a broken local `/rds` WebSocket as a transmitter fault: when that source is unavailable, group-loss alerting is paused until the connection returns and a new baseline is observed.
 
 ---
 

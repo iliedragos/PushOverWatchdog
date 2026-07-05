@@ -48,5 +48,8 @@
   "alertCooldownMinutes": 10,
   "sendRecoveryNotifications": true,
   "includeRdsInfo": true,
-  "debugLogging": false
+  "debugLogging": false,
+  "rdsGroupMonitoringEnabled": false,
+  "rdsGroupMissingSeconds": 10,
+  "rdsGroupRequireCarrier": true
 }

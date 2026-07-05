@@ -9,6 +9,7 @@
       2) blank / silence: RF signal present, but captured audio below threshold for a configured period
       3) RDS missing: RF signal present, but no valid RDS identity (PI or PS) is decoded for a configured period
       4) stereo indicator unstable/off: the webserver stereo flag drops repeatedly while signal/audio are otherwise OK
+      5) RDS group stream loss: a previously active raw RDS group stream stops delivering usable group B blocks
   - Sends optional recovery notifications.
   - Provides rolling RadioText logging, retained for the most recent 7 days.
   - Supports independently switchable Pushover, Telegram and Zabbix notification channels.
@@ -42,6 +43,9 @@ const MIN_TUNE_COMMAND_GAP_MS = 3000;
 const MAX_NOTIFICATION_RESPONSE_BYTES = 32768;
 const MAX_CONFIG_STRING_CHARS = 512;
 const MAX_TEXT_WS_MESSAGE_BYTES = 262144;
+const MAX_RDS_GROUP_WS_MESSAGE_BYTES = 65536;
+const RDS_GROUP_WS_RECONNECT_MS = 5000;
+const RDS_GROUP_ARM_VALID_PACKETS = 3;
 const MAX_STATUS_STRING_CHARS = 128;
 const RT_LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const RT_LOG_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
@@ -153,6 +157,13 @@ const defaultConfig = {
   rdsMissingSeconds: 30,
   requireCarrierForRds: true,
 
+  // Raw /rds group monitoring is opt-in. It is armed only after the current
+  // target has delivered several usable groups, so a station that never sends
+  // RDS groups cannot create a false "lost groups" alert.
+  rdsGroupMonitoringEnabled: false,
+  rdsGroupMissingSeconds: 10,
+  rdsGroupRequireCarrier: true,
+
   blankSeconds: 30,
   audioSilenceThresholdDbfs: -45,
   requireCarrierForBlank: true,
@@ -182,6 +193,8 @@ function mergeAndNormalizeConfig(rawConfig) {
   merged.zabbixEnabled = normalizeBoolean(merged.zabbixEnabled, defaultConfig.zabbixEnabled);
   merged.radioTextLoggingEnabled = normalizeBoolean(merged.radioTextLoggingEnabled, defaultConfig.radioTextLoggingEnabled);
   merged.requireCarrierForRds = normalizeBoolean(merged.requireCarrierForRds, defaultConfig.requireCarrierForRds);
+  merged.rdsGroupMonitoringEnabled = normalizeBoolean(merged.rdsGroupMonitoringEnabled, defaultConfig.rdsGroupMonitoringEnabled);
+  merged.rdsGroupRequireCarrier = normalizeBoolean(merged.rdsGroupRequireCarrier, defaultConfig.rdsGroupRequireCarrier);
   merged.requireCarrierForBlank = normalizeBoolean(merged.requireCarrierForBlank, defaultConfig.requireCarrierForBlank);
   merged.stereoMonitorEnabled = normalizeBoolean(merged.stereoMonitorEnabled, defaultConfig.stereoMonitorEnabled);
   merged.stereoRequireCarrier = normalizeBoolean(merged.stereoRequireCarrier, defaultConfig.stereoRequireCarrier);
@@ -214,6 +227,7 @@ function mergeAndNormalizeConfig(rawConfig) {
   merged.signalThreshold = finiteNumber(merged.signalThreshold, defaultConfig.signalThreshold);
   merged.noCarrierSeconds = positiveNumber(merged.noCarrierSeconds, defaultConfig.noCarrierSeconds, 1);
   merged.rdsMissingSeconds = positiveNumber(merged.rdsMissingSeconds, defaultConfig.rdsMissingSeconds, 1);
+  merged.rdsGroupMissingSeconds = positiveNumber(merged.rdsGroupMissingSeconds, defaultConfig.rdsGroupMissingSeconds, 1);
   merged.blankSeconds = positiveNumber(merged.blankSeconds, defaultConfig.blankSeconds, 1);
   merged.audioSilenceThresholdDbfs = finiteNumber(merged.audioSilenceThresholdDbfs, defaultConfig.audioSilenceThresholdDbfs);
   merged.stereoWindowSeconds = positiveNumber(merged.stereoWindowSeconds, defaultConfig.stereoWindowSeconds, Math.max(2, Number(merged.checkIntervalSeconds || defaultConfig.checkIntervalSeconds)));
@@ -445,6 +459,12 @@ function applyConfig(nextConfig, reason) {
     // sequence state deliberately remains intact to avoid duplicate entries.
     clearPendingRadioTextCandidate();
   }
+  if (previous && (previous.rdsGroupMonitoringEnabled !== config.rdsGroupMonitoringEnabled ||
+      previous.rdsGroupRequireCarrier !== config.rdsGroupRequireCarrier ||
+      Number(previous.rdsGroupMissingSeconds) !== Number(config.rdsGroupMissingSeconds))) {
+    resetAllRdsGroupTracking();
+    if (!config.rdsGroupMonitoringEnabled) closeRdsGroupWebSocket();
+  }
   sendPluginMessage('PushoverWatchdog:config', sanitizedConfigForUi(config));
   sendPluginMessage('PushoverWatchdog:status', currentStatusPayload());
   logInfo(`[${PLUGIN_NAME}] Configuration reloaded (${reason}).`);
@@ -562,6 +582,7 @@ let activeTuneStartedAt = 0;
 let lastCheckAt = 0;
 let lastData = null;
 let textWs = null;
+let rdsGroupWs = null;
 let pluginWs = null;
 let states = new Map();
 let currentAudio = {
@@ -576,6 +597,9 @@ let audioDataHandler = null;
 let audioCloseHandler = null;
 let textReconnectTimer = null;
 let connectingTextWebSocket = false;
+let rdsGroupReconnectTimer = null;
+let connectingRdsGroupWebSocket = false;
+let rdsGroupSocketConnected = false;
 let radioTextLogEntries = [];
 // RadioText commonly alternates between two RDS A/B sequences (for example,
 // now-playing text and a station/promo message). Keep the latest settled value
@@ -902,16 +926,23 @@ function getState(freq) {
     states.set(key, {
       noCarrierSince: 0,
       rdsMissingSince: 0,
+      rdsGroupMissingSince: 0,
+      rdsGroupLastSeenAt: 0,
+      rdsGroupLastType: '',
+      rdsGroupValidPackets: 0,
+      rdsGroupArmed: false,
       blankSince: 0,
       stereoHistory: [],
       stereoRecoverySince: 0,
       recoverySince: 0,
       noCarrierAlerted: false,
       rdsMissingAlerted: false,
+      rdsGroupAlerted: false,
       blankAlerted: false,
       stereoAlerted: false,
       lastNoCarrierAlert: 0,
       lastRdsMissingAlert: 0,
+      lastRdsGroupAlert: 0,
       lastBlankAlert: 0,
       lastStereoAlert: 0,
       lastRecoveryAlert: 0
@@ -926,6 +957,30 @@ function resetFrequencyStates() {
   activeFrequency = null;
   activeTuneStartedAt = 0;
   offTargetSinceAt = 0;
+}
+
+function resetRdsGroupTrackingForFrequency(freq) {
+  if (!freq) return;
+  const st = getState(freq);
+  st.rdsGroupMissingSince = 0;
+  st.rdsGroupLastSeenAt = 0;
+  st.rdsGroupLastType = '';
+  st.rdsGroupValidPackets = 0;
+  st.rdsGroupArmed = false;
+  st.rdsGroupAlerted = false;
+  st.lastRdsGroupAlert = 0;
+}
+
+function resetAllRdsGroupTracking() {
+  for (const st of states.values()) {
+    st.rdsGroupMissingSince = 0;
+    st.rdsGroupLastSeenAt = 0;
+    st.rdsGroupLastType = '';
+    st.rdsGroupValidPackets = 0;
+    st.rdsGroupArmed = false;
+    st.rdsGroupAlerted = false;
+    st.lastRdsGroupAlert = 0;
+  }
 }
 
 
@@ -1103,6 +1158,117 @@ function connectTextWebSocket() {
     textWs = null;
     logWarn(`[${PLUGIN_NAME}] /text WebSocket closed. Reconnecting in 5 seconds.`);
     scheduleTextWebSocketReconnect();
+  });
+}
+
+// FM-DX exposes raw RDS group frames on the local /rds WebSocket. Each frame
+// contains four blocks and uses ---- for a block that did not decode cleanly.
+// Group type/version live in block B, therefore a usable packet needs a valid
+// B block. This matches what an operator sees in the RDS Expert group display.
+function parseUsableRdsGroupTypes(message) {
+  if (Buffer.byteLength(message) > MAX_RDS_GROUP_WS_MESSAGE_BYTES) return [];
+  const text = Buffer.isBuffer(message) ? message.toString('utf8') : String(message ?? '');
+  const types = [];
+  const framePattern = /G:\r?\n([0-9A-Fa-f-]{16})\r?\n/g;
+  let match;
+  while ((match = framePattern.exec(text)) !== null) {
+    const frame = match[1];
+    if (!/^(?:[0-9A-Fa-f]{4}|----){4}$/.test(frame)) continue;
+    const blockB = frame.slice(4, 8);
+    if (!/^[0-9A-Fa-f]{4}$/.test(blockB)) continue;
+    const blockValue = Number.parseInt(blockB, 16);
+    if (!Number.isInteger(blockValue)) continue;
+    const groupNumber = (blockValue >>> 12) & 0x0f;
+    const version = (blockValue & 0x0800) === 0 ? 'A' : 'B';
+    types.push(`${groupNumber}${version}`);
+  }
+  return types;
+}
+
+function recordRdsGroupFrames(message) {
+  if (!config.enabled || !config.rdsGroupMonitoringEnabled || !rdsGroupSocketConnected) return;
+  const target = activeFrequency;
+  if (!target || !isObservedOnFrequency(target)) return;
+  const now = Date.now();
+  const settleMs = Math.max(0, Number(config.tuneSettleSeconds || 4)) * 1000;
+  if ((now - activeTuneStartedAt) < settleMs) return;
+
+  const types = parseUsableRdsGroupTypes(message);
+  if (!types.length) return;
+
+  const st = getState(target);
+  for (const type of types) {
+    st.rdsGroupLastSeenAt = now;
+    st.rdsGroupLastType = type;
+    st.rdsGroupValidPackets = Math.min(1000000000, st.rdsGroupValidPackets + 1);
+    st.rdsGroupMissingSince = 0;
+    if (!st.rdsGroupArmed && st.rdsGroupValidPackets >= RDS_GROUP_ARM_VALID_PACKETS) {
+      st.rdsGroupArmed = true;
+      logDebug(`RDS group monitoring armed on ${frequencyKey(target)} MHz after ${st.rdsGroupValidPackets} usable groups.`);
+    }
+  }
+}
+
+function closeRdsGroupWebSocket() {
+  runtimeClearTimer(rdsGroupReconnectTimer);
+  rdsGroupReconnectTimer = null;
+  connectingRdsGroupWebSocket = false;
+  rdsGroupSocketConnected = false;
+  if (rdsGroupWs) {
+    try { rdsGroupWs.removeAllListeners(); } catch (_) {}
+    try { rdsGroupWs.close(); } catch (_) {}
+    rdsGroupWs = null;
+  }
+}
+
+runtimeAddCleanup(closeRdsGroupWebSocket);
+
+function scheduleRdsGroupWebSocketReconnect() {
+  if (rdsGroupReconnectTimer || !config.enabled || !config.rdsGroupMonitoringEnabled) return;
+  rdsGroupReconnectTimer = runtimeSetTimeout(() => {
+    rdsGroupReconnectTimer = null;
+    connectRdsGroupWebSocket();
+  }, RDS_GROUP_WS_RECONNECT_MS);
+}
+
+function connectRdsGroupWebSocket() {
+  if (!config.enabled || !config.rdsGroupMonitoringEnabled) return;
+  if (connectingRdsGroupWebSocket || (rdsGroupWs && (rdsGroupWs.readyState === WebSocket.OPEN || rdsGroupWs.readyState === WebSocket.CONNECTING))) return;
+
+  const webserverPort = serverConfig.webserver.webserverPort || 8080;
+  const url = `ws://127.0.0.1:${webserverPort}/rds`;
+  connectingRdsGroupWebSocket = true;
+  rdsGroupWs = new WebSocket(url);
+  rdsGroupWs.on('open', () => {
+    connectingRdsGroupWebSocket = false;
+    rdsGroupSocketConnected = true;
+    if (activeFrequency) resetRdsGroupTrackingForFrequency(activeFrequency);
+    logInfo(`[${PLUGIN_NAME}] Connected to /rds WebSocket for RDS group monitoring.`);
+  });
+  rdsGroupWs.on('message', message => {
+    try {
+      if (Buffer.byteLength(message) > MAX_RDS_GROUP_WS_MESSAGE_BYTES) {
+        logWarn(`[${PLUGIN_NAME}] Ignored oversized /rds WebSocket message.`);
+        return;
+      }
+      recordRdsGroupFrames(message);
+    } catch (err) {
+      logDebug(`Ignored malformed /rds WebSocket message: ${err.message}`);
+    }
+  });
+  rdsGroupWs.on('error', err => {
+    connectingRdsGroupWebSocket = false;
+    rdsGroupSocketConnected = false;
+    logWarn(`[${PLUGIN_NAME}] /rds WebSocket error: ${err.message}`);
+  });
+  rdsGroupWs.on('close', () => {
+    connectingRdsGroupWebSocket = false;
+    rdsGroupSocketConnected = false;
+    rdsGroupWs = null;
+    if (config.enabled && config.rdsGroupMonitoringEnabled) {
+      logWarn(`[${PLUGIN_NAME}] /rds WebSocket closed. Reconnecting in ${RDS_GROUP_WS_RECONNECT_MS / 1000} seconds.`);
+      scheduleRdsGroupWebSocketReconnect();
+    }
   });
 }
 
@@ -1288,6 +1454,7 @@ function tuneTo(freq, reason = 'scheduled', options = {}) {
   Promise.resolve(pluginsApi.sendPrivilegedCommand(command, true))
     .then(ok => {
       if (ok) {
+        resetRdsGroupTrackingForFrequency(key);
         logDebug(`Tuned to ${key} MHz (${reason})`);
         applyReceiverOptionsAfterTune(reason);
       } else {
@@ -1335,6 +1502,10 @@ function chooseNextFrequency(now) {
 
 function currentStatusPayload() {
   const d = lastData || sanitizeReceiverData(dataHandler.dataToSend) || {}
+  const activeState = activeFrequency ? states.get(frequencyKey(activeFrequency)) : null;
+  const rdsGroupLastSeenAgeSeconds = activeState?.rdsGroupLastSeenAt
+    ? Number(Math.max(0, (Date.now() - activeState.rdsGroupLastSeenAt) / 1000).toFixed(1))
+    : null;
   return {
     activeFrequency,
     currentFrequency: d.freq,
@@ -1347,6 +1518,12 @@ function currentStatusPayload() {
     rds: d.rds,
     rdsPresent: isRdsPresent(d),
     rdsValid: hasValidRdsIdentity(d),
+    rdsGroupMonitoringEnabled: !!config.rdsGroupMonitoringEnabled,
+    rdsGroupSocketConnected: !!rdsGroupSocketConnected,
+    rdsGroupArmed: !!activeState?.rdsGroupArmed,
+    rdsGroupLastType: safeStatusString(activeState?.rdsGroupLastType || '', 4),
+    rdsGroupLastSeenAgeSeconds,
+    rdsGroupValidPackets: Number(activeState?.rdsGroupValidPackets || 0),
     stereo: isStereoOn(d),
     stereoRaw: d.st,
     rt0: d.rt0,
@@ -1368,11 +1545,14 @@ function tick() {
 
   if (!config.enabled) {
     if (lastAudioStream || currentAudio.attached) detachAudioMonitor();
+    if (rdsGroupWs || rdsGroupSocketConnected) closeRdsGroupWebSocket();
     sendPluginMessage('PushoverWatchdog:status', currentStatusPayload());
     return;
   }
 
   attachAudioMonitor();
+  if (config.rdsGroupMonitoringEnabled) connectRdsGroupWebSocket();
+  else if (rdsGroupWs || rdsGroupSocketConnected) closeRdsGroupWebSocket();
 
   if ((now - lastCheckAt) < Math.max(1, Number(config.checkIntervalSeconds || 2)) * 1000) return;
   lastCheckAt = now;
@@ -1545,6 +1725,32 @@ function evaluateFrequency(freq, data, now) {
     st.rdsMissingSince = 0;
   }
 
+  // RDS group stream loss. This is intentionally independent from PI/PS:
+  // PI/PS can remain cached while raw RDS groups have already stopped arriving.
+  // The monitor only arms after receiving several usable group B blocks on the
+  // current target, so it detects a sudden loss without alarming on stations
+  // that never provided raw group traffic. A local /rds connection problem also
+  // suppresses this condition rather than being misreported as transmitter loss.
+  const canCheckRdsGroups = !!config.rdsGroupMonitoringEnabled &&
+    rdsGroupSocketConnected &&
+    st.rdsGroupArmed &&
+    (!config.rdsGroupRequireCarrier || signalOk);
+  const rdsGroupAgeSeconds = st.rdsGroupLastSeenAt ? Math.max(0, (now - st.rdsGroupLastSeenAt) / 1000) : Infinity;
+  const rdsGroupsMissingForAlert = canCheckRdsGroups && rdsGroupAgeSeconds >= Number(config.rdsGroupMissingSeconds || 10);
+  if (rdsGroupsMissingForAlert) {
+    if (!st.rdsGroupMissingSince) st.rdsGroupMissingSince = st.rdsGroupLastSeenAt || now;
+    const elapsed = (now - st.rdsGroupMissingSince) / 1000;
+    if (shouldSendActiveAlert(st.rdsGroupAlerted, st.lastRdsGroupAlert, now)) {
+      const wasAlerted = st.rdsGroupAlerted;
+      st.rdsGroupAlerted = true;
+      st.lastRdsGroupAlert = now;
+      const lastType = st.rdsGroupLastType || 'unknown';
+      sendAlert('rdsGroupsMissing', freq, data, activeAlertReason(`RDS group stream missing for ${Math.round(rdsGroupAgeSeconds)} seconds (last usable group: ${lastType}).`, wasAlerted, elapsed));
+    }
+  } else if (canCheckRdsGroups) {
+    st.rdsGroupMissingSince = 0;
+  }
+
   // Blank / silence condition.
   if (canCheckBlank && audioSilent) {
     if (!st.blankSince) st.blankSince = now;
@@ -1574,8 +1780,11 @@ function evaluateFrequency(freq, data, now) {
   }
 
   const stereoNormal = st.stereoAlerted ? (canCheckStereo && stereoOn) : (!canCheckStereo || stereoOn);
-  const normal = signalOk && (!canCheckBlank || !audioSilent) && (!canCheckRds || !isRdsMissingForAlert(data)) && stereoNormal;
-  if (normal && (st.noCarrierAlerted || st.rdsMissingAlerted || st.blankAlerted || st.stereoAlerted)) {
+  const rdsGroupsNormal = st.rdsGroupAlerted
+    ? (canCheckRdsGroups && !rdsGroupsMissingForAlert)
+    : (!canCheckRdsGroups || !rdsGroupsMissingForAlert);
+  const normal = signalOk && (!canCheckBlank || !audioSilent) && (!canCheckRds || !isRdsMissingForAlert(data)) && rdsGroupsNormal && stereoNormal;
+  if (normal && (st.noCarrierAlerted || st.rdsMissingAlerted || st.rdsGroupAlerted || st.blankAlerted || st.stereoAlerted)) {
     if (!st.recoverySince) st.recoverySince = now;
     const recoveredFor = (now - st.recoverySince) / 1000;
     const recoveryRequired = st.stereoAlerted && !st.noCarrierAlerted && !st.rdsMissingAlerted && !st.blankAlerted ? Number(config.stereoRecoverySeconds || 30) : Number(config.recoverySeconds || 10);
@@ -1583,14 +1792,17 @@ function evaluateFrequency(freq, data, now) {
       const recoveredTypes = [];
       if (st.noCarrierAlerted) recoveredTypes.push('carrier');
       if (st.rdsMissingAlerted) recoveredTypes.push('RDS');
+      if (st.rdsGroupAlerted) recoveredTypes.push('RDS group stream');
       if (st.blankAlerted) recoveredTypes.push('modulation');
       if (st.stereoAlerted) recoveredTypes.push('stereo indicator');
       st.noCarrierAlerted = false;
       st.rdsMissingAlerted = false;
+      st.rdsGroupAlerted = false;
       st.blankAlerted = false;
       st.stereoAlerted = false;
       st.noCarrierSince = 0;
       st.rdsMissingSince = 0;
+      st.rdsGroupMissingSince = 0;
       st.blankSince = 0;
       st.stereoRecoverySince = 0;
       st.recoverySince = 0;
@@ -1630,6 +1842,13 @@ function formatRds(data) {
   if (isNonEmptyText(data?.rt0) || isNonEmptyText(data?.rt1)) lines.push(`RT: ${String(data.rt0 || data.rt1).trim()}`);
   lines.push(`RDS lock: ${rdsLock ? 'yes' : '?'}`);
   lines.push(`RDS valid: ${rdsValid ? 'yes' : 'no'}`);
+  if (config.rdsGroupMonitoringEnabled && activeFrequency) {
+    const st = states.get(frequencyKey(activeFrequency));
+    if (st?.rdsGroupArmed) {
+      const age = st.rdsGroupLastSeenAt ? Math.max(0, (Date.now() - st.rdsGroupLastSeenAt) / 1000).toFixed(1) : '?';
+      lines.push(`RDS group: ${st.rdsGroupLastType || '?'} (${age}s ago)`);
+    }
+  }
   return lines.length ? '\n' + lines.join('\n') : '';
 }
 
@@ -1639,6 +1858,7 @@ function sendAlert(kind, freq, data, reason) {
   const titleMap = {
     noCarrier: 'FM-DX: Signal below threshold / white noise',
     rdsMissing: 'FM-DX: RDS missing',
+    rdsGroupsMissing: 'FM-DX: RDS group stream lost',
     blank: 'FM-DX: Blank / no modulation',
     stereoUnstable: 'FM-DX: Stereo indicator unstable',
     recovery: 'FM-DX: Recovery'
@@ -1899,6 +2119,7 @@ loadRadioTextLog();
 loadRadioTextSequenceState();
 startConfigHotReload();
 connectTextWebSocket();
+if (config.enabled && config.rdsGroupMonitoringEnabled) connectRdsGroupWebSocket();
 registerPluginWebSocketAuthHandlers();
 runtimeSetInterval(tick, 1000);
 runtimeSetInterval(() => pruneRadioTextLog(Date.now(), true), RT_LOG_CLEANUP_INTERVAL_MS);

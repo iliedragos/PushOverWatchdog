@@ -58,7 +58,7 @@
   }
 
   const pluginName = 'Pushover Watchdog';
-  const pluginVersion = '1.0.1';
+  const pluginVersion = '1.0.2';
   const pluginAuthor = 'by Play Radio Constanta';
   let config = null;
   let status = null;
@@ -256,7 +256,7 @@
         <div class="pwd-header">
           <div>
             <h2>FM Monitor</h2>
-            <div class="pwd-subtitle">Pushover Watchdog v${pluginVersion} · ${pluginAuthor} · signal / modulation / RDS / stereo monitoring</div>
+            <div class="pwd-subtitle">Pushover Watchdog v${pluginVersion} · ${pluginAuthor} · signal / modulation / RDS / RDS-group / stereo monitoring</div>
           </div>
           <button id="pwd-close" class="pwd-icon-btn" aria-label="Close">×</button>
         </div>
@@ -268,6 +268,7 @@
           ${checkbox('pwd-recovery', 'Send recovery notifications', config.sendRecoveryNotifications)}
           ${checkbox('pwd-rds', 'Include RDS info in notifications', config.includeRdsInfo)}
           ${checkbox('pwd-rtlog-enabled', 'Enable RadioText logging (fully loaded RT only / rolling 7 days)', config.radioTextLoggingEnabled)}
+          ${checkbox('pwd-rds-groups-enabled', 'Enable RDS group stream monitoring', config.rdsGroupMonitoringEnabled)}
           ${checkbox('pwd-require-carrier', 'Blank detection requires carrier present', config.requireCarrierForBlank)}
           ${checkbox('pwd-require-carrier-rds', 'RDS missing detection requires carrier present', config.requireCarrierForRds)}
           ${checkbox('pwd-stereo-enabled', 'Enable stereo indicator monitoring', config.stereoMonitorEnabled)}
@@ -336,6 +337,8 @@
           ${field('pwd-signal-threshold', `Minimum expected RF signal (${signalUnitLabel(config.signalUnit)})`, config.signalThreshold, 'number', 'Set this relative to the normal signal level of the monitored station. Below this value triggers signal-below-threshold / white-noise detection.')}
           ${field('pwd-no-carrier-seconds', 'Signal-below-threshold duration seconds', config.noCarrierSeconds, 'number')}
           ${field('pwd-rds-missing-seconds', 'RDS missing duration seconds', config.rdsMissingSeconds, 'number', 'Alert when no valid RDS identity (PI or PS) is decoded for this long while monitoring the target frequency.')}
+          ${field('pwd-rds-group-missing-seconds', 'RDS group stream loss duration seconds', config.rdsGroupMissingSeconds, 'number', 'Arms only after three usable RDS groups are received at the current target. A usable group has a valid B block, so transient unreadable blocks do not count as normal traffic.')}
+          ${checkbox('pwd-rds-groups-require-carrier', 'RDS group stream monitoring requires carrier present', config.rdsGroupRequireCarrier)}
           ${field('pwd-blank-dbfs', 'Blank audio threshold dBFS', config.audioSilenceThresholdDbfs, 'number', 'Typical start: -45 dBFS. More negative = less sensitive.')}
           ${field('pwd-blank-seconds', 'Blank duration seconds', config.blankSeconds, 'number')}
           ${field('pwd-recovery-seconds', 'Recovery confirmation seconds', config.recoverySeconds, 'number')}
@@ -408,12 +411,24 @@
     const rtLogText = status.radioTextLoggingEnabled
       ? `${safeText(status.radioTextLogCount || 0, 20)} entries / 7 days`
       : 'disabled';
+    let rdsGroupsText = 'disabled';
+    if (status.rdsGroupMonitoringEnabled) {
+      if (!status.rdsGroupSocketConnected) rdsGroupsText = 'local /rds unavailable';
+      else if (!status.rdsGroupArmed) rdsGroupsText = 'waiting for baseline';
+      else {
+        const age = Number.isFinite(status.rdsGroupLastSeenAgeSeconds)
+          ? `${status.rdsGroupLastSeenAgeSeconds.toFixed(1)}s ago`
+          : 'age unknown';
+        rdsGroupsText = `${safeText(status.rdsGroupLastType || '?', 4)} · ${age}`;
+      }
+    }
 
     appendItem('Status', status.enabled ? 'enabled' : 'disabled');
     appendItem('Target', targetFrequency);
     appendItem('Current', currentFrequency);
     appendItem('Signal', signalText);
     appendItem('RDS valid', status.rdsValid ? 'yes' : 'no');
+    appendItem('RDS groups', rdsGroupsText);
     appendItem('Stereo', status.stereo ? 'yes' : 'no');
     appendItem('Audio', audioText);
     appendItem('RT log', rtLogText);
@@ -449,6 +464,9 @@
       zabbixHost: document.getElementById('pwd-zabbix-host').value.trim(),
       zabbixKey: document.getElementById('pwd-zabbix-key').value.trim(),
       radioTextLoggingEnabled: document.getElementById('pwd-rtlog-enabled').checked,
+      rdsGroupMonitoringEnabled: document.getElementById('pwd-rds-groups-enabled').checked,
+      rdsGroupMissingSeconds: readNum('pwd-rds-group-missing-seconds', 10),
+      rdsGroupRequireCarrier: document.getElementById('pwd-rds-groups-require-carrier').checked,
       frequencies,
       checkIntervalSeconds: readNum('pwd-interval', 2),
       tuneSettleSeconds: readNum('pwd-settle', 4),

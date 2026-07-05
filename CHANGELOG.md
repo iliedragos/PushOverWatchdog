@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.0.2 - 2026-07-05
+
+- Added optional **RDS group stream monitoring** based on FM-DX Webserver’s local raw `/rds` WebSocket. The plugin now detects when a previously active stream of usable RDS groups suddenly stops.
+- Added a configurable group-stream loss timer and an optional carrier requirement in the FM Monitor panel and `PushoverWatchdog.json`.
+- The detector arms only after three usable RDS groups have been received on the current target frequency, preventing false alerts on stations that never provided group traffic.
+- A usable group requires a valid RDS block B, which contains the group type/version. This matches the practical operator view in RDS Expert and ignores malformed or unreadable group frames.
+- Added `rdsGroupsMissing` alerts and recovery handling, including the last usable group type in notifications and live status.
+- Added bounded, loopback-only `/rds` WebSocket handling with input-size limits, strict frame validation, reconnect cleanup and no alerting when the local raw-RDS socket itself is unavailable.
+
 ## v1.0.1 - 2026-06-02
 
 - Added optional **RadioText logging** in the admin panel, with a dedicated top-panel log button and an admin-only RadioText history viewer.
