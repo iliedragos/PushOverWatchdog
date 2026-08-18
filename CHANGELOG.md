@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.3 - 2026-07-13
+
+- Fixed false positive **RDS group stream lost** alerts when the operator temporarily tunes the receiver away from the configured watchdog frequency.
+- RDS group monitoring is now explicitly suspended while the receiver is off the active monitored frequency and is re-armed only after the target frequency is observed as stable again.
+- The raw `/rds` stream is still ignored unless the receiver is on the configured target frequency; groups from temporarily monitored stations are not counted for the watchdog target.
+- Preserved the existing RDS group baseline logic, recovery handling, notification channels and receiver retune behaviour.
+
 ## v1.0.2 - 2026-07-05
 
 - Added optional **RDS group stream monitoring** based on FM-DX Webserver’s local raw `/rds` WebSocket. The plugin now detects when a previously active stream of usable RDS groups suddenly stops.

@@ -46,6 +46,7 @@ const MAX_TEXT_WS_MESSAGE_BYTES = 262144;
 const MAX_RDS_GROUP_WS_MESSAGE_BYTES = 65536;
 const RDS_GROUP_WS_RECONNECT_MS = 5000;
 const RDS_GROUP_ARM_VALID_PACKETS = 3;
+const RDS_GROUP_TARGET_STABLE_MS = 2000;
 const MAX_STATUS_STRING_CHARS = 128;
 const RT_LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const RT_LOG_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
@@ -581,6 +582,9 @@ let activeFrequency = null;
 let activeTuneStartedAt = 0;
 let lastCheckAt = 0;
 let lastData = null;
+let lastObservedFrequencyKey = null;
+let observedFrequencyChangedAt = 0;
+let observedTargetStableSinceAt = 0;
 let textWs = null;
 let rdsGroupWs = null;
 let pluginWs = null;
@@ -943,6 +947,7 @@ function getState(freq) {
       lastNoCarrierAlert: 0,
       lastRdsMissingAlert: 0,
       lastRdsGroupAlert: 0,
+      rdsGroupOffTargetSuspendedAt: 0,
       lastBlankAlert: 0,
       lastStereoAlert: 0,
       lastRecoveryAlert: 0
@@ -957,6 +962,14 @@ function resetFrequencyStates() {
   activeFrequency = null;
   activeTuneStartedAt = 0;
   offTargetSinceAt = 0;
+  lastObservedFrequencyKey = null;
+  observedFrequencyChangedAt = 0;
+  observedTargetStableSinceAt = 0;
+}
+
+function resetObservedTargetStability(now = Date.now()) {
+  observedTargetStableSinceAt = 0;
+  observedFrequencyChangedAt = now;
 }
 
 function resetRdsGroupTrackingForFrequency(freq) {
@@ -969,6 +982,28 @@ function resetRdsGroupTrackingForFrequency(freq) {
   st.rdsGroupArmed = false;
   st.rdsGroupAlerted = false;
   st.lastRdsGroupAlert = 0;
+  st.rdsGroupOffTargetSuspendedAt = 0;
+}
+
+function suspendRdsGroupTrackingForOffTarget(freq, observedFreq, now = Date.now()) {
+  if (!freq || !config.rdsGroupMonitoringEnabled) return;
+  const st = getState(freq);
+  const hadTracking = st.rdsGroupArmed || st.rdsGroupValidPackets > 0 || st.rdsGroupLastSeenAt || st.rdsGroupMissingSince;
+  if (!hadTracking && !st.rdsGroupAlerted) return;
+
+  st.rdsGroupMissingSince = 0;
+  st.rdsGroupLastSeenAt = 0;
+  st.rdsGroupLastType = '';
+  st.rdsGroupValidPackets = 0;
+  st.rdsGroupArmed = false;
+  st.rdsGroupOffTargetSuspendedAt = now;
+  st.recoverySince = 0;
+
+  if (!st.rdsGroupAlerted) {
+    st.lastRdsGroupAlert = 0;
+  }
+
+  logDebug(`RDS group monitoring suspended for ${frequencyKey(freq)} MHz because the receiver is temporarily on ${Number.isFinite(Number(observedFreq)) ? Number(observedFreq).toFixed(3) : 'another'} MHz.`);
 }
 
 function resetAllRdsGroupTracking() {
@@ -980,6 +1015,7 @@ function resetAllRdsGroupTracking() {
     st.rdsGroupArmed = false;
     st.rdsGroupAlerted = false;
     st.lastRdsGroupAlert = 0;
+    st.rdsGroupOffTargetSuspendedAt = 0;
   }
 }
 
@@ -1146,6 +1182,7 @@ function connectTextWebSocket() {
         return;
       }
       lastData = sanitizeReceiverData(JSON.parse(message.toString()));
+      updateObservedFrequencyTracking(lastData, Date.now());
       recordRadioTextIfChanged(lastData);
     } catch (_) {}
   });
@@ -1188,8 +1225,8 @@ function parseUsableRdsGroupTypes(message) {
 function recordRdsGroupFrames(message) {
   if (!config.enabled || !config.rdsGroupMonitoringEnabled || !rdsGroupSocketConnected) return;
   const target = activeFrequency;
-  if (!target || !isObservedOnFrequency(target)) return;
   const now = Date.now();
+  if (!target || !canUseRdsGroupFramesForTarget(target, now)) return;
   const settleMs = Math.max(0, Number(config.tuneSettleSeconds || 4)) * 1000;
   if ((now - activeTuneStartedAt) < settleMs) return;
 
@@ -1386,10 +1423,46 @@ function currentObservedFrequency() {
   return Number.isFinite(f) ? f : NaN;
 }
 
+function frequenciesMatch(observed, target, toleranceMhz = 0.015) {
+  const observedNumber = Number(observed);
+  const targetNumber = Number(target);
+  return Number.isFinite(observedNumber) && Number.isFinite(targetNumber) && Math.abs(observedNumber - targetNumber) <= toleranceMhz;
+}
+
 function isObservedOnFrequency(freq, toleranceMhz = 0.015) {
-  const observed = currentObservedFrequency();
-  const target = Number(freq);
-  return Number.isFinite(observed) && Number.isFinite(target) && Math.abs(observed - target) <= toleranceMhz;
+  return frequenciesMatch(currentObservedFrequency(), freq, toleranceMhz);
+}
+
+function updateObservedFrequencyTracking(data, now = Date.now()) {
+  const observed = Number(data?.freq);
+  if (!Number.isFinite(observed)) {
+    observedTargetStableSinceAt = 0;
+    return;
+  }
+
+  const observedKey = frequencyKey(observed);
+  if (lastObservedFrequencyKey !== observedKey) {
+    lastObservedFrequencyKey = observedKey;
+    observedFrequencyChangedAt = now;
+  }
+
+  if (!activeFrequency) {
+    observedTargetStableSinceAt = 0;
+    return;
+  }
+
+  if (frequenciesMatch(observed, activeFrequency)) {
+    if (!observedTargetStableSinceAt) observedTargetStableSinceAt = now;
+  } else {
+    observedTargetStableSinceAt = 0;
+    suspendRdsGroupTrackingForOffTarget(activeFrequency, observed, now);
+  }
+}
+
+function canUseRdsGroupFramesForTarget(freq, now = Date.now()) {
+  if (!isObservedOnFrequency(freq)) return false;
+  if (!observedTargetStableSinceAt) return false;
+  return (now - observedTargetStableSinceAt) >= RDS_GROUP_TARGET_STABLE_MS;
 }
 
 function receiverBoolean(value) {
@@ -1472,6 +1545,7 @@ function chooseNextFrequency(now) {
     activeFrequency = freqs[0];
     activeTuneStartedAt = now;
     offTargetSinceAt = 0;
+    resetObservedTargetStability(now);
     tuneTo(activeFrequency, 'initial target');
     return activeFrequency;
   }
@@ -1485,6 +1559,7 @@ function chooseNextFrequency(now) {
       activeFrequency = only;
       activeTuneStartedAt = now;
       offTargetSinceAt = 0;
+      resetObservedTargetStability(now);
       tuneTo(activeFrequency, 'single target changed');
     }
     return activeFrequency;
@@ -1495,6 +1570,7 @@ function chooseNextFrequency(now) {
     activeFrequency = freqs[freqIndex];
     activeTuneStartedAt = now;
     offTargetSinceAt = 0;
+    resetObservedTargetStability(now);
     tuneTo(activeFrequency, 'next target');
   }
   return activeFrequency;
@@ -1570,9 +1646,11 @@ function tick() {
   }
 
   const d = lastData || sanitizeReceiverData(dataHandler.dataToSend) || {}
+  updateObservedFrequencyTracking(d, now);
   const observedFreq = Number(d.freq);
   const target = Number(targetFreq);
   if (!Number.isFinite(observedFreq) || Math.abs(observedFreq - target) > 0.015) {
+    suspendRdsGroupTrackingForOffTarget(targetFreq, observedFreq, now);
     maybeForceRetune(targetFreq, observedFreq, now);
     sendPluginMessage('PushoverWatchdog:status', currentStatusPayload());
     return;
@@ -1603,6 +1681,7 @@ function maybeForceRetune(targetFreq, observedFreq, now) {
   lastForcedTuneAt = now;
   activeTuneStartedAt = now;
   offTargetSinceAt = 0;
+  resetObservedTargetStability(now);
   tuneTo(targetFreq, `forced retune after ${intervalSeconds}s grace, observed ${Number.isFinite(observedFreq) ? observedFreq.toFixed(3) : 'unknown'} MHz`, { force: true });
 }
 

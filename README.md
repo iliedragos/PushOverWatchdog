@@ -241,6 +241,8 @@ This optional monitor watches the raw RDS group stream exposed by FM-DX Webserve
 
 The monitor is deliberately conservative: it first waits for three usable groups on the currently monitored frequency, then alerts only when no further usable group arrives for the configured period. A usable group must contain a valid **block B**, because that block identifies the RDS group type/version such as `0A`, `2A` or `15A`.
 
+If the receiver is temporarily tuned away from the configured watchdog frequency, RDS group monitoring is suspended and no groups from the temporary station are counted. When the receiver returns to the target frequency, the group monitor waits for a fresh baseline before it can alert again.
+
 ```json
 {
   "rdsGroupMonitoringEnabled": true,
