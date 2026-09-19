@@ -10,6 +10,7 @@
       3) RDS missing: RF signal present, but no valid RDS identity (PI or PS) is decoded for a configured period
       4) stereo indicator unstable/off: the webserver stereo flag drops repeatedly while signal/audio are otherwise OK
       5) RDS group stream loss: a previously active raw RDS group stream stops delivering usable group B blocks
+      6) RDS group interruption: four consecutive raw RDS frames arrive with an unreadable block B
   - Sends optional recovery notifications.
   - Provides rolling RadioText logging, retained for the most recent 7 days.
   - Supports independently switchable Pushover, Telegram and Zabbix notification channels.
@@ -46,6 +47,7 @@ const MAX_TEXT_WS_MESSAGE_BYTES = 262144;
 const MAX_RDS_GROUP_WS_MESSAGE_BYTES = 65536;
 const RDS_GROUP_WS_RECONNECT_MS = 5000;
 const RDS_GROUP_ARM_VALID_PACKETS = 3;
+const RDS_GROUP_INTERRUPTION_UNREADABLE_FRAMES = 4;
 const RDS_GROUP_TARGET_STABLE_MS = 2000;
 const MAX_STATUS_STRING_CHARS = 128;
 const RT_LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -935,6 +937,7 @@ function getState(freq) {
       rdsGroupLastType: '',
       rdsGroupValidPackets: 0,
       rdsGroupArmed: false,
+      rdsGroupUnreadableStreak: 0,
       blankSince: 0,
       stereoHistory: [],
       stereoRecoverySince: 0,
@@ -942,6 +945,7 @@ function getState(freq) {
       noCarrierAlerted: false,
       rdsMissingAlerted: false,
       rdsGroupAlerted: false,
+      rdsGroupInterruptionAlerted: false,
       blankAlerted: false,
       stereoAlerted: false,
       lastNoCarrierAlert: 0,
@@ -980,7 +984,9 @@ function resetRdsGroupTrackingForFrequency(freq) {
   st.rdsGroupLastType = '';
   st.rdsGroupValidPackets = 0;
   st.rdsGroupArmed = false;
+  st.rdsGroupUnreadableStreak = 0;
   st.rdsGroupAlerted = false;
+  st.rdsGroupInterruptionAlerted = false;
   st.lastRdsGroupAlert = 0;
   st.rdsGroupOffTargetSuspendedAt = 0;
 }
@@ -996,6 +1002,7 @@ function suspendRdsGroupTrackingForOffTarget(freq, observedFreq, now = Date.now(
   st.rdsGroupLastType = '';
   st.rdsGroupValidPackets = 0;
   st.rdsGroupArmed = false;
+  st.rdsGroupUnreadableStreak = 0;
   st.rdsGroupOffTargetSuspendedAt = now;
   st.recoverySince = 0;
 
@@ -1013,7 +1020,9 @@ function resetAllRdsGroupTracking() {
     st.rdsGroupLastType = '';
     st.rdsGroupValidPackets = 0;
     st.rdsGroupArmed = false;
+    st.rdsGroupUnreadableStreak = 0;
     st.rdsGroupAlerted = false;
+    st.rdsGroupInterruptionAlerted = false;
     st.lastRdsGroupAlert = 0;
     st.rdsGroupOffTargetSuspendedAt = 0;
   }
@@ -1200,26 +1209,54 @@ function connectTextWebSocket() {
 
 // FM-DX exposes raw RDS group frames on the local /rds WebSocket. Each frame
 // contains four blocks and uses ---- for a block that did not decode cleanly.
-// Group type/version live in block B, therefore a usable packet needs a valid
-// B block. This matches what an operator sees in the RDS Expert group display.
-function parseUsableRdsGroupTypes(message) {
+// Group type/version live in block B. Keep valid and unreadable block-B frames
+// distinct so short decode interruptions can be detected without changing the
+// existing long-duration group-stream-loss logic.
+function parseRdsGroupFrameEvents(message) {
   if (Buffer.byteLength(message) > MAX_RDS_GROUP_WS_MESSAGE_BYTES) return [];
   const text = Buffer.isBuffer(message) ? message.toString('utf8') : String(message ?? '');
-  const types = [];
+  const events = [];
   const framePattern = /G:\r?\n([0-9A-Fa-f-]{16})\r?\n/g;
   let match;
   while ((match = framePattern.exec(text)) !== null) {
     const frame = match[1];
     if (!/^(?:[0-9A-Fa-f]{4}|----){4}$/.test(frame)) continue;
     const blockB = frame.slice(4, 8);
+    if (blockB === '----') {
+      events.push({ usable: false, type: '' });
+      continue;
+    }
     if (!/^[0-9A-Fa-f]{4}$/.test(blockB)) continue;
     const blockValue = Number.parseInt(blockB, 16);
     if (!Number.isInteger(blockValue)) continue;
     const groupNumber = (blockValue >>> 12) & 0x0f;
     const version = (blockValue & 0x0800) === 0 ? 'A' : 'B';
-    types.push(`${groupNumber}${version}`);
+    events.push({ usable: true, type: `${groupNumber}${version}` });
   }
-  return types;
+  return events;
+}
+
+function advanceRdsGroupInterruptionState(st, events, threshold = RDS_GROUP_INTERRUPTION_UNREADABLE_FRAMES) {
+  const result = { thresholdReached: false, recovered: false };
+  const limit = Math.max(1, Math.trunc(Number(threshold) || RDS_GROUP_INTERRUPTION_UNREADABLE_FRAMES));
+
+  for (const event of events) {
+    if (event?.usable) {
+      if (st.rdsGroupUnreadableStreak > 0) result.recovered = true;
+      st.rdsGroupUnreadableStreak = 0;
+      continue;
+    }
+
+    if (!st.rdsGroupArmed) {
+      st.rdsGroupUnreadableStreak = 0;
+      continue;
+    }
+
+    st.rdsGroupUnreadableStreak = Math.min(1000000000, st.rdsGroupUnreadableStreak + 1);
+    if (st.rdsGroupUnreadableStreak === limit) result.thresholdReached = true;
+  }
+
+  return result;
 }
 
 function recordRdsGroupFrames(message) {
@@ -1230,18 +1267,43 @@ function recordRdsGroupFrames(message) {
   const settleMs = Math.max(0, Number(config.tuneSettleSeconds || 4)) * 1000;
   if ((now - activeTuneStartedAt) < settleMs) return;
 
-  const types = parseUsableRdsGroupTypes(message);
-  if (!types.length) return;
+  const events = parseRdsGroupFrameEvents(message);
+  if (!events.length) return;
 
   const st = getState(target);
-  for (const type of types) {
-    st.rdsGroupLastSeenAt = now;
-    st.rdsGroupLastType = type;
-    st.rdsGroupValidPackets = Math.min(1000000000, st.rdsGroupValidPackets + 1);
-    st.rdsGroupMissingSince = 0;
-    if (!st.rdsGroupArmed && st.rdsGroupValidPackets >= RDS_GROUP_ARM_VALID_PACKETS) {
-      st.rdsGroupArmed = true;
-      logDebug(`RDS group monitoring armed on ${frequencyKey(target)} MHz after ${st.rdsGroupValidPackets} usable groups.`);
+  const signal = signalFromRawDbf(Number(lastData?.sig));
+  const signalOk = Number.isFinite(signal) && signal >= Number(config.signalThreshold || 20);
+
+  for (const event of events) {
+    if (event.usable) {
+      advanceRdsGroupInterruptionState(st, [event]);
+      st.rdsGroupLastSeenAt = now;
+      st.rdsGroupLastType = event.type;
+      st.rdsGroupValidPackets = Math.min(1000000000, st.rdsGroupValidPackets + 1);
+      st.rdsGroupMissingSince = 0;
+      if (!st.rdsGroupArmed && st.rdsGroupValidPackets >= RDS_GROUP_ARM_VALID_PACKETS) {
+        st.rdsGroupArmed = true;
+        logDebug(`RDS group monitoring armed on ${frequencyKey(target)} MHz after ${st.rdsGroupValidPackets} usable groups.`);
+      }
+      continue;
+    }
+
+    if (config.rdsGroupRequireCarrier && !signalOk) {
+      st.rdsGroupUnreadableStreak = 0;
+      continue;
+    }
+
+    const transition = advanceRdsGroupInterruptionState(st, [event]);
+    if (transition.thresholdReached && !st.rdsGroupInterruptionAlerted) {
+      st.rdsGroupInterruptionAlerted = true;
+      st.recoverySince = 0;
+      const lastType = st.rdsGroupLastType || 'unknown';
+      sendAlert(
+        'rdsGroupInterrupted',
+        target,
+        lastData || {},
+        `RDS group decoding interruption: ${RDS_GROUP_INTERRUPTION_UNREADABLE_FRAMES} consecutive unreadable groups detected (last usable group: ${lastType}).`
+      );
     }
   }
 }
@@ -1862,8 +1924,9 @@ function evaluateFrequency(freq, data, now) {
   const rdsGroupsNormal = st.rdsGroupAlerted
     ? (canCheckRdsGroups && !rdsGroupsMissingForAlert)
     : (!canCheckRdsGroups || !rdsGroupsMissingForAlert);
-  const normal = signalOk && (!canCheckBlank || !audioSilent) && (!canCheckRds || !isRdsMissingForAlert(data)) && rdsGroupsNormal && stereoNormal;
-  if (normal && (st.noCarrierAlerted || st.rdsMissingAlerted || st.rdsGroupAlerted || st.blankAlerted || st.stereoAlerted)) {
+  const rdsGroupInterruptionNormal = !st.rdsGroupInterruptionAlerted || st.rdsGroupUnreadableStreak === 0;
+  const normal = signalOk && (!canCheckBlank || !audioSilent) && (!canCheckRds || !isRdsMissingForAlert(data)) && rdsGroupsNormal && rdsGroupInterruptionNormal && stereoNormal;
+  if (normal && (st.noCarrierAlerted || st.rdsMissingAlerted || st.rdsGroupAlerted || st.rdsGroupInterruptionAlerted || st.blankAlerted || st.stereoAlerted)) {
     if (!st.recoverySince) st.recoverySince = now;
     const recoveredFor = (now - st.recoverySince) / 1000;
     const recoveryRequired = st.stereoAlerted && !st.noCarrierAlerted && !st.rdsMissingAlerted && !st.blankAlerted ? Number(config.stereoRecoverySeconds || 30) : Number(config.recoverySeconds || 10);
@@ -1872,16 +1935,19 @@ function evaluateFrequency(freq, data, now) {
       if (st.noCarrierAlerted) recoveredTypes.push('carrier');
       if (st.rdsMissingAlerted) recoveredTypes.push('RDS');
       if (st.rdsGroupAlerted) recoveredTypes.push('RDS group stream');
+      if (st.rdsGroupInterruptionAlerted) recoveredTypes.push('RDS group decoding');
       if (st.blankAlerted) recoveredTypes.push('modulation');
       if (st.stereoAlerted) recoveredTypes.push('stereo indicator');
       st.noCarrierAlerted = false;
       st.rdsMissingAlerted = false;
       st.rdsGroupAlerted = false;
+      st.rdsGroupInterruptionAlerted = false;
       st.blankAlerted = false;
       st.stereoAlerted = false;
       st.noCarrierSince = 0;
       st.rdsMissingSince = 0;
       st.rdsGroupMissingSince = 0;
+      st.rdsGroupUnreadableStreak = 0;
       st.blankSince = 0;
       st.stereoRecoverySince = 0;
       st.recoverySince = 0;
@@ -1938,6 +2004,7 @@ function sendAlert(kind, freq, data, reason) {
     noCarrier: 'FM-DX: Signal below threshold / white noise',
     rdsMissing: 'FM-DX: RDS missing',
     rdsGroupsMissing: 'FM-DX: RDS group stream lost',
+    rdsGroupInterrupted: 'FM-DX: RDS group interruption',
     blank: 'FM-DX: Blank / no modulation',
     stereoUnstable: 'FM-DX: Stereo indicator unstable',
     recovery: 'FM-DX: Recovery'

@@ -58,7 +58,7 @@
   }
 
   const pluginName = 'Pushover Watchdog';
-  const pluginVersion = '1.0.3';
+  const pluginVersion = '1.0.4';
   const pluginAuthor = 'by Play Radio Constanta';
   let config = null;
   let status = null;

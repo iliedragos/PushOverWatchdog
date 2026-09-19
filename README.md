@@ -14,6 +14,7 @@ The plugin is designed for FM monitoring setups using TEF / Headless TEF receive
 - Blank audio / no modulation detection
 - Missing valid RDS detection
 - Sudden RDS group-stream loss detection (optional)
+- Short RDS group decoding-interruption detection (`--` gaps after 4 consecutive unreadable groups)
 - Stereo indicator instability detection
 - Recovery notifications
 - Pushover, Telegram & Zabbix alert integration
@@ -252,6 +253,10 @@ If the receiver is temporarily tuned away from the configured watchdog frequency
 ```
 
 The default of 10 seconds is intended to catch a real interruption without reacting to a short decode glitch. The plugin does not treat a broken local `/rds` WebSocket as a transmitter fault: when that source is unavailable, group-loss alerting is paused until the connection returns and a new baseline is observed.
+
+The same monitor also detects **short decoding interruptions** that are visible in RDS Expert as consecutive `--` group entries. Once the normal three-group baseline is armed, the plugin raises an **RDS group interruption** alert when it receives **4 consecutive raw RDS frames whose block B is unreadable (`----`)**. One to three isolated unreadable frames are ignored, and the counter is reset as soon as a usable group is decoded again.
+
+This short-interruption check follows the same target-frequency safeguards as the long-duration monitor: it is ignored while the receiver is temporarily tuned away from the configured watchdog frequency, during the target-settle period, when the local `/rds` source is unavailable, and—when enabled—while the RF signal is below the configured carrier threshold.
 
 ---
 

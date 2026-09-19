@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.4 - 2026-09-14
+
+- Added detection for short **RDS group decoding interruptions** that do not last long enough to trigger the existing group-stream-loss timer.
+- A decoding interruption is reported after **4 consecutive raw RDS frames with an unreadable block B** (`----`), matching the `--` gaps visible in RDS Expert.
+- The short-interruption detector only runs after the normal three-group baseline has armed and only while the receiver is stably tuned to the configured watchdog frequency.
+- Valid RDS group decoding immediately resets the unreadable-frame streak; recovery uses the existing recovery confirmation and notification flow.
+- Preserved the existing long-duration RDS group-stream-loss detector, off-target suspension logic, notification channels and receiver retune behaviour.
+
 ## v1.0.3 - 2026-07-13
 
 - Fixed false positive **RDS group stream lost** alerts when the operator temporarily tunes the receiver away from the configured watchdog frequency.
@@ -15,6 +23,7 @@
 - A usable group requires a valid RDS block B, which contains the group type/version. This matches the practical operator view in RDS Expert and ignores malformed or unreadable group frames.
 - Added `rdsGroupsMissing` alerts and recovery handling, including the last usable group type in notifications and live status.
 - Added bounded, loopback-only `/rds` WebSocket handling with input-size limits, strict frame validation, reconnect cleanup and no alerting when the local raw-RDS socket itself is unavailable.
+- Updated `README.md` and `PushoverWatchdog.example.json` with the new monitoring option.
 
 ## v1.0.1 - 2026-06-02
 
