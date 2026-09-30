@@ -10,7 +10,7 @@
       3) RDS missing: RF signal present, but no valid RDS identity (PI or PS) is decoded for a configured period
       4) stereo indicator unstable/off: the webserver stereo flag drops repeatedly while signal/audio are otherwise OK
       5) RDS group stream loss: a previously active raw RDS group stream stops delivering usable group B blocks
-      6) RDS group interruption: four consecutive raw RDS frames arrive with an unreadable block B
+      6) RDS group interruption: configurable number of short four-frame decode interruptions within a rolling minute
   - Sends optional recovery notifications.
   - Provides rolling RadioText logging, retained for the most recent 7 days.
   - Supports independently switchable Pushover, Telegram and Zabbix notification channels.
@@ -29,6 +29,14 @@ const { serverConfig } = require('../../server/server_config');
 const dataHandler = require('../../server/datahandler');
 const pluginsApi = require('../../server/plugins_api');
 const audioServer = require('../../server/stream/3las.server');
+const {
+  BASE_INTERRUPTION_UNREADABLE_FRAMES,
+  DEFAULT_INTERRUPTION_EVENTS_PER_MINUTE,
+  normalizeInterruptionEventsPerMinute,
+  registerInterruptionEvent,
+  advanceRdsGroupInterruptionState,
+  resetRdsGroupInterruptionState
+} = require('./rds-group-monitor');
 
 const PLUGIN_NAME = 'Pushover Watchdog';
 const CONFIG_PATH = path.join(__dirname, '../../plugins_configs/PushoverWatchdog.json');
@@ -38,6 +46,7 @@ const DBF_TO_DBUV_OFFSET = 11.25;
 const DBF_TO_DBM_OFFSET = 120;
 const MAX_PLUGIN_MESSAGE_BYTES = 65536;
 const MAX_PUSHOVER_MESSAGE_CHARS = 950;
+const MAX_PUSHOVER_EMERGENCY_SECONDS = 10800;
 const MAX_TELEGRAM_MESSAGE_CHARS = 4000;
 const MAX_FREQUENCIES = 64;
 const MIN_TUNE_COMMAND_GAP_MS = 3000;
@@ -47,7 +56,7 @@ const MAX_TEXT_WS_MESSAGE_BYTES = 262144;
 const MAX_RDS_GROUP_WS_MESSAGE_BYTES = 65536;
 const RDS_GROUP_WS_RECONNECT_MS = 5000;
 const RDS_GROUP_ARM_VALID_PACKETS = 3;
-const RDS_GROUP_INTERRUPTION_UNREADABLE_FRAMES = 4;
+const RDS_GROUP_INTERRUPTION_UNREADABLE_FRAMES = BASE_INTERRUPTION_UNREADABLE_FRAMES;
 const RDS_GROUP_TARGET_STABLE_MS = 2000;
 const MAX_STATUS_STRING_CHARS = 128;
 const RT_LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -62,6 +71,8 @@ const MAX_RT_SEQUENCE_STATE_FILE_BYTES = 256 * 1024;
 const MAX_RT_LOG_FILE_BYTES = 32 * 1024 * 1024;
 const MAX_RT_LOG_ENTRIES = 100000;
 const MAX_STEREO_HISTORY_SAMPLES = 7200;
+const ADMIN_SESSION_REFRESH_TIMEOUT_MS = 5000;
+const NOTIFICATION_TOTAL_TIMEOUT_MS = 12000;
 const PRIVATE_FILE_MODE = 0o600;
 // FM-DX publishes RadioText progressively as characters are decoded. Wait until
 // the active RT message has remained unchanged before writing it to history.
@@ -72,14 +83,17 @@ const RUNTIME_KEY = '__PushoverWatchdogRuntime';
 // FM-DX can reload plugins inside the same Node.js process. Keep a small
 // runtime registry so an old copy does not leave active timers, WebSockets,
 // or event listeners behind after a reload.
-if (global[RUNTIME_KEY] && typeof global[RUNTIME_KEY].stop === 'function') {
-  try { global[RUNTIME_KEY].stop(); } catch (_) {}
+if (globalThis[RUNTIME_KEY] && typeof globalThis[RUNTIME_KEY].stop === 'function') {
+  try { globalThis[RUNTIME_KEY].stop(); } catch (_) {}
 }
 
 const runtime = {
   timers: new Set(),
   cleanups: new Set(),
+  stopped: false,
   stop() {
+    if (this.stopped) return;
+    this.stopped = true;
     for (const timer of this.timers) {
       try { clearTimeout(timer); clearInterval(timer); } catch (_) {}
     }
@@ -90,19 +104,23 @@ const runtime = {
     this.cleanups.clear();
   }
 };
-global[RUNTIME_KEY] = runtime;
+globalThis[RUNTIME_KEY] = runtime;
 
 function runtimeSetTimeout(fn, delay) {
+  if (runtime.stopped) return null;
   const timer = setTimeout(() => {
     runtime.timers.delete(timer);
-    fn();
+    if (!runtime.stopped) fn();
   }, delay);
   runtime.timers.add(timer);
   return timer;
 }
 
 function runtimeSetInterval(fn, delay) {
-  const timer = setInterval(fn, delay);
+  if (runtime.stopped) return null;
+  const timer = setInterval(() => {
+    if (!runtime.stopped) fn();
+  }, delay);
   runtime.timers.add(timer);
   return timer;
 }
@@ -115,6 +133,10 @@ function runtimeClearTimer(timer) {
 }
 
 function runtimeAddCleanup(fn) {
+  if (runtime.stopped) {
+    try { fn(); } catch (_) {}
+    return fn;
+  }
   runtime.cleanups.add(fn);
   return fn;
 }
@@ -165,6 +187,7 @@ const defaultConfig = {
   // RDS groups cannot create a false "lost groups" alert.
   rdsGroupMonitoringEnabled: false,
   rdsGroupMissingSeconds: 10,
+  rdsGroupInterruptionEventsPerMinute: DEFAULT_INTERRUPTION_EVENTS_PER_MINUTE,
   rdsGroupRequireCarrier: true,
 
   blankSeconds: 30,
@@ -187,6 +210,57 @@ const defaultConfig = {
   includeRdsInfo: true,
   debugLogging: false
 };
+
+const UI_CONFIG_KEYS = Object.freeze([
+  'enabled',
+  'pushoverEnabled',
+  'pushoverDevice',
+  'pushoverSound',
+  'pushoverPriority',
+  'pushoverRetrySeconds',
+  'pushoverExpireSeconds',
+  'telegramEnabled',
+  'telegramChatId',
+  'telegramThreadId',
+  'zabbixEnabled',
+  'zabbixServer',
+  'zabbixPort',
+  'zabbixHost',
+  'zabbixKey',
+  'radioTextLoggingEnabled',
+  'frequencies',
+  'checkIntervalSeconds',
+  'tuneSettleSeconds',
+  'dwellSeconds',
+  'forceRetuneSeconds',
+  'forceRetuneBandwidthHz',
+  'forceRetuneCeq',
+  'forceRetuneIms',
+  'signalUnit',
+  'signalThreshold',
+  'noCarrierSeconds',
+  'rdsMissingSeconds',
+  'requireCarrierForRds',
+  'blankSeconds',
+  'audioSilenceThresholdDbfs',
+  'requireCarrierForBlank',
+  'rdsGroupMonitoringEnabled',
+  'rdsGroupMissingSeconds',
+  'rdsGroupInterruptionEventsPerMinute',
+  'rdsGroupRequireCarrier',
+  'stereoMonitorEnabled',
+  'stereoWindowSeconds',
+  'stereoMinDrops',
+  'stereoMinOffSamples',
+  'stereoRequireCarrier',
+  'stereoRequireAudio',
+  'stereoRequireRdsValid',
+  'stereoRecoverySeconds',
+  'recoverySeconds',
+  'alertCooldownMinutes',
+  'sendRecoveryNotifications',
+  'includeRdsInfo'
+]);
 
 function mergeAndNormalizeConfig(rawConfig) {
   const merged = { ...defaultConfig, ...(rawConfig || {}) };
@@ -231,6 +305,7 @@ function mergeAndNormalizeConfig(rawConfig) {
   merged.noCarrierSeconds = positiveNumber(merged.noCarrierSeconds, defaultConfig.noCarrierSeconds, 1);
   merged.rdsMissingSeconds = positiveNumber(merged.rdsMissingSeconds, defaultConfig.rdsMissingSeconds, 1);
   merged.rdsGroupMissingSeconds = positiveNumber(merged.rdsGroupMissingSeconds, defaultConfig.rdsGroupMissingSeconds, 1);
+  merged.rdsGroupInterruptionEventsPerMinute = normalizeInterruptionEventsPerMinute(merged.rdsGroupInterruptionEventsPerMinute);
   merged.blankSeconds = positiveNumber(merged.blankSeconds, defaultConfig.blankSeconds, 1);
   merged.audioSilenceThresholdDbfs = finiteNumber(merged.audioSilenceThresholdDbfs, defaultConfig.audioSilenceThresholdDbfs);
   merged.stereoWindowSeconds = positiveNumber(merged.stereoWindowSeconds, defaultConfig.stereoWindowSeconds, Math.max(2, Number(merged.checkIntervalSeconds || defaultConfig.checkIntervalSeconds)));
@@ -240,8 +315,14 @@ function mergeAndNormalizeConfig(rawConfig) {
   merged.recoverySeconds = positiveNumber(merged.recoverySeconds, defaultConfig.recoverySeconds, 1);
   merged.alertCooldownMinutes = positiveNumber(merged.alertCooldownMinutes, defaultConfig.alertCooldownMinutes, 0);
   merged.pushoverPriority = Math.max(-2, Math.min(2, Math.trunc(finiteNumber(merged.pushoverPriority, defaultConfig.pushoverPriority))));
-  merged.pushoverRetrySeconds = positiveNumber(merged.pushoverRetrySeconds, defaultConfig.pushoverRetrySeconds, 30);
-  merged.pushoverExpireSeconds = positiveNumber(merged.pushoverExpireSeconds, defaultConfig.pushoverExpireSeconds, 30);
+  merged.pushoverRetrySeconds = Math.min(
+    MAX_PUSHOVER_EMERGENCY_SECONDS,
+    positiveNumber(merged.pushoverRetrySeconds, defaultConfig.pushoverRetrySeconds, 30)
+  );
+  merged.pushoverExpireSeconds = Math.min(
+    MAX_PUSHOVER_EMERGENCY_SECONDS,
+    positiveNumber(merged.pushoverExpireSeconds, defaultConfig.pushoverExpireSeconds, 30)
+  );
   if (merged.pushoverExpireSeconds < merged.pushoverRetrySeconds) {
     merged.pushoverExpireSeconds = merged.pushoverRetrySeconds;
   }
@@ -301,6 +382,13 @@ function isPlainObject(value) {
 
 function safeStatusString(value, maxChars = MAX_STATUS_STRING_CHARS) {
   return cleanConfigString(value, maxChars);
+}
+
+function safeErrorMessage(error, fallback = 'Unknown error') {
+  const message = error && typeof error === 'object' && 'message' in error
+    ? error.message
+    : error;
+  return safeStatusString(message, 512) || fallback;
 }
 
 function sanitizeReceiverData(raw) {
@@ -365,19 +453,32 @@ function restrictPrivateFile(filePath) {
   try { fs.chmodSync(filePath, PRIVATE_FILE_MODE); } catch (_) {}
 }
 
-function writePrivateFileAtomic(filePath, contents) {
+function writePrivateFileAtomicChunks(filePath, chunks) {
   // Keep transient files private and avoid a predictable temporary filename.
   // The exclusive create prevents overwriting an attacker-created symlink on
   // multi-user POSIX hosts where the configuration directory is writable.
   const tmpPath = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+  let fd;
   try {
-    fs.writeFileSync(tmpPath, contents, { encoding: 'utf8', mode: PRIVATE_FILE_MODE, flag: 'wx' });
+    fd = fs.openSync(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, PRIVATE_FILE_MODE);
+    for (const chunk of chunks) {
+      if (chunk) fs.writeFileSync(fd, chunk, { encoding: 'utf8' });
+    }
+    fs.closeSync(fd);
+    fd = undefined;
     restrictPrivateFile(tmpPath);
     fs.renameSync(tmpPath, filePath);
     restrictPrivateFile(filePath);
   } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch (_) {}
+    }
     try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (_) {}
   }
+}
+
+function writePrivateFileAtomic(filePath, contents) {
+  writePrivateFileAtomicChunks(filePath, [contents]);
 }
 
 function appendPrivateUtf8File(filePath, contents) {
@@ -462,9 +563,11 @@ function applyConfig(nextConfig, reason) {
     // sequence state deliberately remains intact to avoid duplicate entries.
     clearPendingRadioTextCandidate();
   }
-  if (previous && (previous.rdsGroupMonitoringEnabled !== config.rdsGroupMonitoringEnabled ||
+  if (previous && (previous.enabled !== config.enabled ||
+      previous.rdsGroupMonitoringEnabled !== config.rdsGroupMonitoringEnabled ||
       previous.rdsGroupRequireCarrier !== config.rdsGroupRequireCarrier ||
-      Number(previous.rdsGroupMissingSeconds) !== Number(config.rdsGroupMissingSeconds))) {
+      Number(previous.rdsGroupMissingSeconds) !== Number(config.rdsGroupMissingSeconds) ||
+      Number(previous.rdsGroupInterruptionEventsPerMinute) !== Number(config.rdsGroupInterruptionEventsPerMinute))) {
     resetAllRdsGroupTracking();
     if (!config.rdsGroupMonitoringEnabled) closeRdsGroupWebSocket();
   }
@@ -525,14 +628,15 @@ function scheduleConfigReload(reason) {
 
 function saveConfig(newConfig) {
   // FM-DX broadcasts client-originated /data_plugins messages to other plugin
-  // clients. Never accept or transport high-value notification secrets in the
-  // browser save payload; retain credentials from the latest valid server-side
-  // config. Reading once here avoids overwriting a token that an administrator
-  // has just edited directly before fs.watch/polling has reloaded it.
-  const uiUpdate = isPlainObject(newConfig) ? { ...newConfig } : {};
-  delete uiUpdate.pushoverUserKey;
-  delete uiUpdate.pushoverApiToken;
-  delete uiUpdate.telegramBotToken;
+  // clients. Accept only fields represented by this UI schema; server-only and
+  // forward-compatible values remain authoritative on disk. Reading once here
+  // also avoids overwriting a credential that an administrator has just edited
+  // directly before fs.watch/polling has reloaded it.
+  const rawUiUpdate = isPlainObject(newConfig) ? newConfig : {};
+  const uiUpdate = {};
+  for (const key of UI_CONFIG_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(rawUiUpdate, key)) uiUpdate[key] = rawUiUpdate[key];
+  }
   let secretSource = config;
   try {
     secretSource = readConfigFile();
@@ -540,6 +644,10 @@ function saveConfig(newConfig) {
     logWarn(`[${PLUGIN_NAME}] UI save kept the loaded notification credentials because the on-disk config was not valid at save time: ${err.message}`);
   }
   const merged = mergeAndNormalizeConfig({
+    // Preserve server-only and forward-compatible keys that are not represented
+    // by the current admin form. UI values still take precedence for editable
+    // settings, while notification credentials remain server-authoritative.
+    ...secretSource,
     ...uiUpdate,
     pushoverUserKey: secretSource.pushoverUserKey,
     pushoverApiToken: secretSource.pushoverApiToken,
@@ -584,19 +692,14 @@ let activeFrequency = null;
 let activeTuneStartedAt = 0;
 let lastCheckAt = 0;
 let lastData = null;
-let lastObservedFrequencyKey = null;
-let observedFrequencyChangedAt = 0;
 let observedTargetStableSinceAt = 0;
 let textWs = null;
 let rdsGroupWs = null;
-let pluginWs = null;
 let states = new Map();
 let currentAudio = {
   dbfs: -Infinity,
-  rms: 0,
   lastUpdate: 0,
   attached: false,
-  sourceName: ''
 };
 let lastAudioStream = null;
 let audioDataHandler = null;
@@ -613,6 +716,7 @@ let radioTextLogEntries = [];
 // is not recorded as a new event.
 let lastSettledRtBySequence = new Map();
 let lastRtLogPruneAt = 0;
+let rtLogRewritePending = false;
 let pendingRtCandidate = null;
 let pendingRtTimer = null;
 
@@ -635,11 +739,28 @@ function normalizeRadioTextLogEntry(raw) {
   };
 }
 
+function* radioTextLogFileChunks() {
+  const targetBytes = 256 * 1024;
+  let lines = [];
+  let bytes = 0;
+  for (const entry of radioTextLogEntries) {
+    const line = `${JSON.stringify(entry)}\n`;
+    const lineBytes = Buffer.byteLength(line, 'utf8');
+    if (bytes > 0 && bytes + lineBytes > targetBytes) {
+      yield lines.join('');
+      lines = [];
+      bytes = 0;
+    }
+    lines.push(line);
+    bytes += lineBytes;
+  }
+  if (lines.length > 0) yield lines.join('');
+}
+
 function rewriteRadioTextLog() {
   const dir = path.dirname(RT_LOG_PATH);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const body = radioTextLogEntries.map(entry => JSON.stringify(entry)).join('\n');
-  writePrivateFileAtomic(RT_LOG_PATH, body ? `${body}\n` : '');
+  writePrivateFileAtomicChunks(RT_LOG_PATH, radioTextLogFileChunks());
 }
 
 function readRadioTextLogBounded() {
@@ -651,7 +772,7 @@ function readRadioTextLogBounded() {
   const fd = fs.openSync(RT_LOG_PATH, 'r');
   try {
     const start = size - MAX_RT_LOG_FILE_BYTES;
-    const buffer = Buffer.alloc(MAX_RT_LOG_FILE_BYTES);
+    const buffer = Buffer.allocUnsafe(MAX_RT_LOG_FILE_BYTES);
     const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, start);
     let tail = buffer.subarray(0, bytesRead).toString('utf8');
     const firstNewLine = tail.indexOf('\n');
@@ -664,15 +785,30 @@ function readRadioTextLogBounded() {
   }
 }
 
-function pruneRadioTextLog(now = Date.now(), forceRewrite = false) {
+function pruneRadioTextLog(now = Date.now(), forceRewrite = false, deferRewrite = false) {
   const cutoff = now - RT_LOG_RETENTION_MS;
   const previousLength = radioTextLogEntries.length;
-  radioTextLogEntries = radioTextLogEntries.filter(entry => Date.parse(entry.timestamp) >= cutoff);
+  let expiredCount = 0;
+  while (expiredCount < radioTextLogEntries.length && Date.parse(radioTextLogEntries[expiredCount].timestamp) < cutoff) {
+    expiredCount++;
+  }
+  if (expiredCount) radioTextLogEntries.splice(0, expiredCount);
+
   if (radioTextLogEntries.length > MAX_RT_LOG_ENTRIES) {
-    radioTextLogEntries = radioTextLogEntries.slice(-MAX_RT_LOG_ENTRIES);
+    radioTextLogEntries.splice(0, radioTextLogEntries.length - MAX_RT_LOG_ENTRIES);
     logWarn(`[${PLUGIN_NAME}] RadioText log reached the safety entry cap; oldest retained entries were discarded.`);
   }
-  if (forceRewrite || radioTextLogEntries.length !== previousLength) rewriteRadioTextLog();
+  rtLogRewritePending = rtLogRewritePending || forceRewrite || radioTextLogEntries.length !== previousLength;
+  if (rtLogRewritePending && !deferRewrite) {
+    try {
+      rewriteRadioTextLog();
+      rtLogRewritePending = false;
+    } catch (err) {
+      // Disk failures must not escape the periodic maintenance pass. Keep the
+      // pending rewrite so the next pass retries it.
+      logWarn(`[${PLUGIN_NAME}] RadioText log maintenance write failed: ${safeErrorMessage(err)}`);
+    }
+  }
   lastRtLogPruneAt = now;
 }
 
@@ -819,7 +955,7 @@ function appendFinalRadioTextEntry(candidate) {
     rememberSettledRadioTextSequence(candidate.sequenceKey, candidate.signature);
     writeRadioTextSequenceState();
     if (radioTextLogEntries.length > MAX_RT_LOG_ENTRIES || !lastRtLogPruneAt || Date.now() - lastRtLogPruneAt >= RT_LOG_CLEANUP_INTERVAL_MS) {
-      pruneRadioTextLog(Date.now(), true);
+      pruneRadioTextLog(Date.now(), false, true);
     }
     sendPluginMessage('PushoverWatchdog:rtLogChanged', { latest: entry });
   } catch (err) {
@@ -891,7 +1027,7 @@ function recordRadioTextIfChanged(data) {
 }
 
 function radioTextLogPage(request = {}) {
-  pruneRadioTextLog(Date.now(), false);
+  pruneRadioTextLog(Date.now(), false, true);
   const requestedLimit = Math.trunc(finiteNumber(request.limit, DEFAULT_RT_LOG_PAGE_SIZE));
   const limit = Math.max(1, Math.min(MAX_RT_LOG_PAGE_SIZE, requestedLimit));
   const parsedBefore = request.before ? Date.parse(String(request.before)) : Infinity;
@@ -923,7 +1059,7 @@ function logDebug(message) {
 
 function frequencyKey(freq) {
   const n = Number(freq);
-  return Number.isFinite(n) ? n.toFixed(3) : String(freq || 'unknown');
+  return Number.isFinite(n) ? n.toFixed(3) : (safeStatusString(freq, 32) || 'unknown');
 }
 
 function getState(freq) {
@@ -938,9 +1074,9 @@ function getState(freq) {
       rdsGroupValidPackets: 0,
       rdsGroupArmed: false,
       rdsGroupUnreadableStreak: 0,
+      rdsGroupInterruptionEventTimes: [],
       blankSince: 0,
       stereoHistory: [],
-      stereoRecoverySince: 0,
       recoverySince: 0,
       noCarrierAlerted: false,
       rdsMissingAlerted: false,
@@ -951,7 +1087,6 @@ function getState(freq) {
       lastNoCarrierAlert: 0,
       lastRdsMissingAlert: 0,
       lastRdsGroupAlert: 0,
-      rdsGroupOffTargetSuspendedAt: 0,
       lastBlankAlert: 0,
       lastStereoAlert: 0,
       lastRecoveryAlert: 0
@@ -966,44 +1101,38 @@ function resetFrequencyStates() {
   activeFrequency = null;
   activeTuneStartedAt = 0;
   offTargetSinceAt = 0;
-  lastObservedFrequencyKey = null;
-  observedFrequencyChangedAt = 0;
   observedTargetStableSinceAt = 0;
 }
 
-function resetObservedTargetStability(now = Date.now()) {
+function resetObservedTargetStability() {
   observedTargetStableSinceAt = 0;
-  observedFrequencyChangedAt = now;
+}
+
+function clearRdsGroupObservationState(st) {
+  st.rdsGroupMissingSince = 0;
+  st.rdsGroupLastSeenAt = 0;
+  st.rdsGroupLastType = '';
+  st.rdsGroupValidPackets = 0;
+  st.rdsGroupArmed = false;
+  resetRdsGroupInterruptionState(st);
 }
 
 function resetRdsGroupTrackingForFrequency(freq) {
   if (!freq) return;
   const st = getState(freq);
-  st.rdsGroupMissingSince = 0;
-  st.rdsGroupLastSeenAt = 0;
-  st.rdsGroupLastType = '';
-  st.rdsGroupValidPackets = 0;
-  st.rdsGroupArmed = false;
-  st.rdsGroupUnreadableStreak = 0;
+  clearRdsGroupObservationState(st);
   st.rdsGroupAlerted = false;
   st.rdsGroupInterruptionAlerted = false;
   st.lastRdsGroupAlert = 0;
-  st.rdsGroupOffTargetSuspendedAt = 0;
 }
 
-function suspendRdsGroupTrackingForOffTarget(freq, observedFreq, now = Date.now()) {
+function suspendRdsGroupTrackingForOffTarget(freq, observedFreq) {
   if (!freq || !config.rdsGroupMonitoringEnabled) return;
   const st = getState(freq);
   const hadTracking = st.rdsGroupArmed || st.rdsGroupValidPackets > 0 || st.rdsGroupLastSeenAt || st.rdsGroupMissingSince;
   if (!hadTracking && !st.rdsGroupAlerted) return;
 
-  st.rdsGroupMissingSince = 0;
-  st.rdsGroupLastSeenAt = 0;
-  st.rdsGroupLastType = '';
-  st.rdsGroupValidPackets = 0;
-  st.rdsGroupArmed = false;
-  st.rdsGroupUnreadableStreak = 0;
-  st.rdsGroupOffTargetSuspendedAt = now;
+  clearRdsGroupObservationState(st);
   st.recoverySince = 0;
 
   if (!st.rdsGroupAlerted) {
@@ -1015,48 +1144,71 @@ function suspendRdsGroupTrackingForOffTarget(freq, observedFreq, now = Date.now(
 
 function resetAllRdsGroupTracking() {
   for (const st of states.values()) {
-    st.rdsGroupMissingSince = 0;
-    st.rdsGroupLastSeenAt = 0;
-    st.rdsGroupLastType = '';
-    st.rdsGroupValidPackets = 0;
-    st.rdsGroupArmed = false;
-    st.rdsGroupUnreadableStreak = 0;
+    clearRdsGroupObservationState(st);
     st.rdsGroupAlerted = false;
     st.rdsGroupInterruptionAlerted = false;
     st.lastRdsGroupAlert = 0;
-    st.rdsGroupOffTargetSuspendedAt = 0;
   }
 }
 
 
-function isSensitivePluginMessage(type) {
-  return type === 'PushoverWatchdog:config' ||
-    type === 'PushoverWatchdog:status' ||
-    type === 'PushoverWatchdog:toast' ||
-    type === 'PushoverWatchdog:rtLogPage' ||
-    type === 'PushoverWatchdog:rtLogChanged';
-}
+const pluginClientBroadcasts = new WeakMap();
 
 function sendPluginMessage(type, value) {
-  const payload = JSON.stringify({ type, value });
-  const sensitive = isSensitivePluginMessage(type);
+  // Every Pushover Watchdog backend message is administrator-only. Defaulting
+  // the whole helper to private delivery prevents future message types from
+  // becoming public merely because a sensitivity allowlist was not updated.
+  if (runtime.stopped) return;
   const wss = pluginsApi.getPluginsWss();
-  if (wss) {
-    wss.clients.forEach(client => {
-      if (client.readyState === WebSocket.OPEN && (!sensitive || client.__pushoverWatchdogAdminAuthenticated === true)) {
-        try { client.send(payload); } catch (_) {}
+  if (!wss) return;
+  wss.clients.forEach(client => {
+    if (!isAdminAuthenticatedWs(client) || client.readyState !== WebSocket.OPEN) return;
+    // Revalidate broadcasts too: a logged-out browser can retain its socket.
+    // Keep only the newest value of each broadcast while a reload is pending,
+    // avoiding an ever-growing callback queue if the session store is slow.
+    const pending = pluginClientBroadcasts.get(client);
+    if (pending) { pending.set(type, value); return; }
+    const messages = new Map([[type, value]]);
+    pluginClientBroadcasts.set(client, messages);
+    refreshAdminAuthenticatedWs(client).then(authenticated => {
+      pluginClientBroadcasts.delete(client);
+      if (!authenticated) return;
+      for (const [messageType, messageValue] of messages) {
+        sendPluginMessageTo(client, messageType, messageValue);
       }
     });
-  }
+  });
 }
 
 function sendPluginMessageTo(client, type, value) {
-  if (!client || client.readyState !== WebSocket.OPEN) return;
-  try { client.send(JSON.stringify({ type, value })); } catch (_) {}
+  if (runtime.stopped || !client || client.readyState !== WebSocket.OPEN) return;
+  const message = { type, value };
+  if (type !== 'PushoverWatchdog:channel' && client.__pushoverWatchdogChannelToken) {
+    message.channelToken = client.__pushoverWatchdogChannelToken;
+  }
+  try { client.send(JSON.stringify(message)); } catch (_) {}
+}
+
+function ensurePluginClientChannel(client) {
+  if (!client || client.__pushoverWatchdogOriginAllowed !== true) return null;
+  if (!client.__pushoverWatchdogChannelToken) {
+    try {
+      client.__pushoverWatchdogChannelToken = crypto.randomBytes(24).toString('base64url');
+    } catch (err) {
+      logError(`[${PLUGIN_NAME}] Failed to create plugin-channel token: ${safeErrorMessage(err)}`);
+      return null;
+    }
+    sendPluginMessageTo(client, 'PushoverWatchdog:channel', {
+      token: client.__pushoverWatchdogChannelToken
+    });
+  }
+  return client.__pushoverWatchdogChannelToken;
 }
 
 function isAdminAuthenticatedWs(client) {
-  return client && client.__pushoverWatchdogAdminAuthenticated === true;
+  return !!(client &&
+    client.__pushoverWatchdogOriginAllowed === true &&
+    client.__pushoverWatchdogSession?.isAdminAuthenticated === true);
 }
 
 function rejectUnauthenticated(client, action) {
@@ -1082,10 +1234,8 @@ function detachAudioMonitor() {
   audioDataHandler = null;
   audioCloseHandler = null;
   currentAudio.attached = false;
-  currentAudio.sourceName = '';
   currentAudio.lastUpdate = 0;
   currentAudio.dbfs = -Infinity;
-  currentAudio.rms = 0;
 }
 
 runtimeAddCleanup(detachAudioMonitor);
@@ -1103,11 +1253,10 @@ function attachAudioMonitor() {
 
   lastAudioStream = stream;
   currentAudio.attached = true;
-  currentAudio.sourceName = stream.constructor ? stream.constructor.name : 'audio stream';
 
   audioDataHandler = (buffer) => {
     try {
-      processAudioBuffer(buffer, Number(serverConfig.audio.audioChannels || 2));
+      processAudioBuffer(buffer);
     } catch (err) {
       logWarn(`[${PLUGIN_NAME}] Audio analysis error: ${err.message}`);
     }
@@ -1125,30 +1274,45 @@ function attachAudioMonitor() {
   logInfo(`[${PLUGIN_NAME}] Audio monitor attached to FM-DX audio stream.`);
 }
 
-function processAudioBuffer(buffer, channels) {
-  if (!Buffer.isBuffer(buffer) || buffer.length < 2) return;
+function pcm16LeDbfs(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 2) return null;
 
   let sumSquares = 0;
   let samples = 0;
   for (let i = 0; i + 1 < buffer.length; i += 2) {
-    const sample = buffer.readInt16LE(i) / 32768;
+    const sample = buffer.readInt16LE(i);
     sumSquares += sample * sample;
     samples++;
   }
-  if (!samples) return;
+  if (!samples) return null;
 
-  const rms = Math.sqrt(sumSquares / samples);
-  const dbfs = rms > 0 ? 20 * Math.log10(rms) : -Infinity;
+  // Divide once after accumulation instead of normalizing every sample. This is
+  // mathematically equivalent and keeps the hot audio path lighter.
+  const rms = Math.sqrt(sumSquares / samples) / 32768;
+  return rms > 0 ? 20 * Math.log10(rms) : -Infinity;
+}
+
+function processAudioBuffer(buffer) {
+  const dbfs = pcm16LeDbfs(buffer);
+  if (dbfs === null) return;
 
   // Light smoothing, enough for silence detection without overreacting to one quiet buffer.
-  if (!Number.isFinite(currentAudio.dbfs)) {
-    currentAudio.dbfs = dbfs;
-    currentAudio.rms = rms;
-  } else {
-    currentAudio.dbfs = (currentAudio.dbfs * 0.75) + (dbfs * 0.25);
-    currentAudio.rms = (currentAudio.rms * 0.75) + (rms * 0.25);
-  }
+  if (!Number.isFinite(currentAudio.dbfs)) currentAudio.dbfs = dbfs;
+  else currentAudio.dbfs = (currentAudio.dbfs * 0.75) + (dbfs * 0.25);
   currentAudio.lastUpdate = Date.now();
+}
+
+function disposeLocalWebSocket(socket) {
+  if (!socket) return;
+  try { socket.removeAllListeners(); } catch (_) {}
+  // A CONNECTING ws can emit an error while being terminated. Keep one no-op
+  // listener after removing plugin listeners so teardown cannot become an
+  // unhandled EventEmitter 'error'.
+  try { socket.on('error', () => {}); } catch (_) {}
+  try {
+    if (socket.readyState === WebSocket.CONNECTING && typeof socket.terminate === 'function') socket.terminate();
+    else socket.close();
+  } catch (_) {}
 }
 
 function closeTextWebSocket() {
@@ -1156,8 +1320,7 @@ function closeTextWebSocket() {
   textReconnectTimer = null;
   connectingTextWebSocket = false;
   if (textWs) {
-    try { textWs.removeAllListeners(); } catch (_) {}
-    try { textWs.close(); } catch (_) {}
+    disposeLocalWebSocket(textWs);
     textWs = null;
   }
 }
@@ -1179,7 +1342,10 @@ function connectTextWebSocket() {
   const url = `ws://127.0.0.1:${webserverPort}/text`;
 
   connectingTextWebSocket = true;
-  textWs = new WebSocket(url);
+  textWs = new WebSocket(url, {
+    maxPayload: MAX_TEXT_WS_MESSAGE_BYTES,
+    perMessageDeflate: false
+  });
   textWs.on('open', () => {
     connectingTextWebSocket = false;
     logInfo(`[${PLUGIN_NAME}] Connected to /text WebSocket.`);
@@ -1202,6 +1368,7 @@ function connectTextWebSocket() {
   textWs.on('close', () => {
     connectingTextWebSocket = false;
     textWs = null;
+    lastData = null;
     logWarn(`[${PLUGIN_NAME}] /text WebSocket closed. Reconnecting in 5 seconds.`);
     scheduleTextWebSocketReconnect();
   });
@@ -1236,35 +1403,12 @@ function parseRdsGroupFrameEvents(message) {
   return events;
 }
 
-function advanceRdsGroupInterruptionState(st, events, threshold = RDS_GROUP_INTERRUPTION_UNREADABLE_FRAMES) {
-  const result = { thresholdReached: false, recovered: false };
-  const limit = Math.max(1, Math.trunc(Number(threshold) || RDS_GROUP_INTERRUPTION_UNREADABLE_FRAMES));
-
-  for (const event of events) {
-    if (event?.usable) {
-      if (st.rdsGroupUnreadableStreak > 0) result.recovered = true;
-      st.rdsGroupUnreadableStreak = 0;
-      continue;
-    }
-
-    if (!st.rdsGroupArmed) {
-      st.rdsGroupUnreadableStreak = 0;
-      continue;
-    }
-
-    st.rdsGroupUnreadableStreak = Math.min(1000000000, st.rdsGroupUnreadableStreak + 1);
-    if (st.rdsGroupUnreadableStreak === limit) result.thresholdReached = true;
-  }
-
-  return result;
-}
-
 function recordRdsGroupFrames(message) {
   if (!config.enabled || !config.rdsGroupMonitoringEnabled || !rdsGroupSocketConnected) return;
   const target = activeFrequency;
   const now = Date.now();
   if (!target || !canUseRdsGroupFramesForTarget(target, now)) return;
-  const settleMs = Math.max(0, Number(config.tuneSettleSeconds || 4)) * 1000;
+  const settleMs = Math.max(0, Number(config.tuneSettleSeconds)) * 1000;
   if ((now - activeTuneStartedAt) < settleMs) return;
 
   const events = parseRdsGroupFrameEvents(message);
@@ -1272,7 +1416,7 @@ function recordRdsGroupFrames(message) {
 
   const st = getState(target);
   const signal = signalFromRawDbf(Number(lastData?.sig));
-  const signalOk = Number.isFinite(signal) && signal >= Number(config.signalThreshold || 20);
+  const signalOk = Number.isFinite(signal) && signal >= Number(config.signalThreshold);
 
   for (const event of events) {
     if (event.usable) {
@@ -1289,21 +1433,32 @@ function recordRdsGroupFrames(message) {
     }
 
     if (config.rdsGroupRequireCarrier && !signalOk) {
-      st.rdsGroupUnreadableStreak = 0;
+      resetRdsGroupInterruptionState(st);
       continue;
     }
 
     const transition = advanceRdsGroupInterruptionState(st, [event]);
     if (transition.thresholdReached && !st.rdsGroupInterruptionAlerted) {
-      st.rdsGroupInterruptionAlerted = true;
-      st.recoverySince = 0;
-      const lastType = st.rdsGroupLastType || 'unknown';
-      sendAlert(
-        'rdsGroupInterrupted',
-        target,
-        lastData || {},
-        `RDS group decoding interruption: ${RDS_GROUP_INTERRUPTION_UNREADABLE_FRAMES} consecutive unreadable groups detected (last usable group: ${lastType}).`
+      const windowState = registerInterruptionEvent(
+        st.rdsGroupInterruptionEventTimes,
+        now,
+        config.rdsGroupInterruptionEventsPerMinute
       );
+      st.rdsGroupInterruptionEventTimes = windowState.timestamps;
+
+      if (windowState.thresholdReached) {
+        st.rdsGroupInterruptionAlerted = true;
+        st.rdsGroupInterruptionEventTimes = [];
+        st.recoverySince = 0;
+        const lastType = st.rdsGroupLastType || 'unknown';
+        const eventWord = windowState.count === 1 ? 'event' : 'events';
+        sendAlert(
+          'rdsGroupInterrupted',
+          target,
+          lastData || {},
+          `RDS group decoding interruptions: ${windowState.count} ${eventWord} within 60 seconds; each event is ${RDS_GROUP_INTERRUPTION_UNREADABLE_FRAMES} consecutive unreadable groups (last usable group: ${lastType}).`
+        );
+      }
     }
   }
 }
@@ -1314,8 +1469,7 @@ function closeRdsGroupWebSocket() {
   connectingRdsGroupWebSocket = false;
   rdsGroupSocketConnected = false;
   if (rdsGroupWs) {
-    try { rdsGroupWs.removeAllListeners(); } catch (_) {}
-    try { rdsGroupWs.close(); } catch (_) {}
+    disposeLocalWebSocket(rdsGroupWs);
     rdsGroupWs = null;
   }
 }
@@ -1337,7 +1491,10 @@ function connectRdsGroupWebSocket() {
   const webserverPort = serverConfig.webserver.webserverPort || 8080;
   const url = `ws://127.0.0.1:${webserverPort}/rds`;
   connectingRdsGroupWebSocket = true;
-  rdsGroupWs = new WebSocket(url);
+  rdsGroupWs = new WebSocket(url, {
+    maxPayload: MAX_RDS_GROUP_WS_MESSAGE_BYTES,
+    perMessageDeflate: false
+  });
   rdsGroupWs.on('open', () => {
     connectingRdsGroupWebSocket = false;
     rdsGroupSocketConnected = true;
@@ -1387,10 +1544,77 @@ function isAllowedWebSocketOrigin(request) {
 
 const pluginClientMessageHandlers = new Map();
 
+function clearPluginClientAuthState(client) {
+  if (!client) return;
+  delete client.__pushoverWatchdogOriginAllowed;
+  delete client.__pushoverWatchdogRequest;
+  delete client.__pushoverWatchdogSession;
+  delete client.__pushoverWatchdogChannelToken;
+}
+
+const pluginClientAuthRefreshes = new WeakMap();
+
+function ownsPluginClient(client, request) {
+  return !runtime.stopped && client?.readyState === WebSocket.OPEN &&
+    pluginClientMessageHandlers.has(client) &&
+    client.__pushoverWatchdogRequest === request;
+}
+
+function refreshAdminAuthenticatedWs(client) {
+  const request = client?.__pushoverWatchdogRequest;
+  if (!ownsPluginClient(client, request) || client.__pushoverWatchdogOriginAllowed !== true) return Promise.resolve(false);
+  const pending = pluginClientAuthRefreshes.get(client);
+  if (pending) return pending;
+  const session = request?.session || client.__pushoverWatchdogSession;
+  if (!session) return Promise.resolve(false);
+
+  // Coalesce concurrent reloads, and discard continuations from closed sockets
+  // or retired plugin copies before touching a replacement runtime's state. A
+  // bounded timeout keeps a stalled external session store from retaining an
+  // unresolved Promise and queued plugin broadcast indefinitely.
+  const refresh = new Promise(resolve => {
+    let settled = false;
+    let timeoutTimer = null;
+    let stopCleanup = null;
+
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      runtimeClearTimer(timeoutTimer);
+      timeoutTimer = null;
+      if (stopCleanup) runtime.cleanups.delete(stopCleanup);
+      stopCleanup = null;
+
+      if (!ownsPluginClient(client, request)) { resolve(false); return; }
+      client.__pushoverWatchdogSession = err ? null : (request?.session || session);
+      resolve(isAdminAuthenticatedWs(client));
+    };
+
+    stopCleanup = runtimeAddCleanup(() => finish(new Error('Plugin runtime stopped.')));
+    timeoutTimer = runtimeSetTimeout(
+      () => finish(new Error('Administrator session refresh timed out.')),
+      ADMIN_SESSION_REFRESH_TIMEOUT_MS
+    );
+
+    try {
+      if (typeof session.reload === 'function') session.reload(finish);
+      else finish();
+    } catch (err) {
+      finish(err);
+    }
+  });
+  pluginClientAuthRefreshes.set(client, refresh);
+  refresh.then(() => {
+    if (pluginClientAuthRefreshes.get(client) === refresh) pluginClientAuthRefreshes.delete(client);
+  });
+  return refresh;
+}
+
 function detachPluginClientMessageHandlers() {
   for (const [client, handlers] of pluginClientMessageHandlers.entries()) {
     try { client.off('message', handlers.message); } catch (_) {}
     try { client.off('close', handlers.close); } catch (_) {}
+    clearPluginClientAuthState(client);
   }
   pluginClientMessageHandlers.clear();
 }
@@ -1406,10 +1630,24 @@ function registerPluginWebSocketAuthHandlers() {
 
   const connectionHandler = (client, request) => {
     const originAllowed = isAllowedWebSocketOrigin(request);
-    client.__pushoverWatchdogAdminAuthenticated = !!(originAllowed && request.session?.isAdminAuthenticated);
+    client.__pushoverWatchdogOriginAllowed = originAllowed;
+    client.__pushoverWatchdogRequest = request || null;
+    client.__pushoverWatchdogSession = request?.session || null;
     if (!originAllowed) logWarn(`[${PLUGIN_NAME}] Rejected plugin WebSocket actions due to invalid Origin header.`);
+    else if (request?.session?.isAdminAuthenticated === true) ensurePluginClientChannel(client);
 
-    const messageHandler = (message) => {
+    const requireAdmin = async (action) => {
+      if (await refreshAdminAuthenticatedWs(client)) {
+        if (!ownsPluginClient(client, request)) return false;
+        return !!ensurePluginClientChannel(client);
+      }
+      if (!ownsPluginClient(client, request)) return false;
+      rejectUnauthenticated(client, action);
+      return false;
+    };
+
+    const messageHandler = async (message) => {
+      if (!ownsPluginClient(client, request)) return;
       if (Buffer.byteLength(message) > MAX_PLUGIN_MESSAGE_BYTES) {
         logWarn(`[${PLUGIN_NAME}] Ignored oversized plugin WebSocket message.`);
         return;
@@ -1420,19 +1658,19 @@ function registerPluginWebSocketAuthHandlers() {
       if (!event.type.startsWith('PushoverWatchdog:')) return;
 
       if (event.type === 'PushoverWatchdog:getConfig') {
-        if (!isAdminAuthenticatedWs(client)) return rejectUnauthenticated(client, 'view Pushover Watchdog settings');
+        if (!(await requireAdmin('view Pushover Watchdog settings'))) return;
         sendPluginMessageTo(client, 'PushoverWatchdog:config', sanitizedConfigForUi());
         return;
       }
 
       if (event.type === 'PushoverWatchdog:getRtLog') {
-        if (!isAdminAuthenticatedWs(client)) return rejectUnauthenticated(client, 'view RadioText log');
+        if (!(await requireAdmin('view RadioText log'))) return;
         sendPluginMessageTo(client, 'PushoverWatchdog:rtLogPage', radioTextLogPage(isPlainObject(event.value) ? event.value : {}));
         return;
       }
 
       if (event.type === 'PushoverWatchdog:saveConfig') {
-        if (!isAdminAuthenticatedWs(client)) return rejectUnauthenticated(client, 'save Pushover Watchdog settings');
+        if (!(await requireAdmin('save Pushover Watchdog settings'))) return;
         try {
           const saved = saveConfig(isPlainObject(event.value) ? event.value : {});
           sendPluginMessageTo(client, 'PushoverWatchdog:config', sanitizedConfigForUi(saved));
@@ -1445,15 +1683,17 @@ function registerPluginWebSocketAuthHandlers() {
       }
 
       if (event.type === 'PushoverWatchdog:test' || event.type === 'PushoverWatchdog:testChannel') {
-        if (!isAdminAuthenticatedWs(client)) return rejectUnauthenticated(client, 'send FM Monitor test notifications');
+        if (!(await requireAdmin('send FM Monitor test notifications'))) return;
         const channel = event.type === 'PushoverWatchdog:test' ? 'pushover' : String(event.value?.channel || '').toLowerCase();
         sendTestNotification(channel)
           .then(() => sendPluginMessageTo(client, 'PushoverWatchdog:toast', { level: 'success', message: `${channelLabel(channel)} test notification sent.` }))
           .catch(err => sendPluginMessageTo(client, 'PushoverWatchdog:toast', { level: 'error', message: `${channelLabel(channel)} test failed: ${err.message}` }));
-        return;
       }
     };
-    const closeHandler = () => pluginClientMessageHandlers.delete(client);
+    const closeHandler = () => {
+      pluginClientMessageHandlers.delete(client);
+      clearPluginClientAuthState(client);
+    };
     pluginClientMessageHandlers.set(client, { message: messageHandler, close: closeHandler });
     client.on('message', messageHandler);
     client.once('close', closeHandler);
@@ -1468,19 +1708,18 @@ function registerPluginWebSocketAuthHandlers() {
 }
 
 function sanitizedConfigForUi(cfg = config) {
-  const visible = { ...cfg };
-  // Credentials are never transmitted through /data_plugins; FM-DX broadcasts
-  // browser-originated plugin messages to other connected plugin clients.
-  delete visible.pushoverUserKey;
-  delete visible.pushoverApiToken;
-  delete visible.telegramBotToken;
+  // Use a strict allowlist instead of cloning the complete server config. This
+  // prevents future server-only or secret fields from being exposed merely
+  // because they were added to the config schema without updating a denylist.
+  const visible = {};
+  for (const key of UI_CONFIG_KEYS) visible[key] = cfg[key];
   visible.pushoverCredentialsConfigured = !!(cfg.pushoverUserKey && cfg.pushoverApiToken);
   visible.telegramBotConfigured = !!cfg.telegramBotToken;
   return visible;
 }
 
 function currentObservedFrequency() {
-  const d = lastData || sanitizeReceiverData(dataHandler.dataToSend) || {}
+  const d = lastData || sanitizeReceiverData(dataHandler.dataToSend) || {};
   const f = Number(d.freq);
   return Number.isFinite(f) ? f : NaN;
 }
@@ -1502,12 +1741,6 @@ function updateObservedFrequencyTracking(data, now = Date.now()) {
     return;
   }
 
-  const observedKey = frequencyKey(observed);
-  if (lastObservedFrequencyKey !== observedKey) {
-    lastObservedFrequencyKey = observedKey;
-    observedFrequencyChangedAt = now;
-  }
-
   if (!activeFrequency) {
     observedTargetStableSinceAt = 0;
     return;
@@ -1517,7 +1750,7 @@ function updateObservedFrequencyTracking(data, now = Date.now()) {
     if (!observedTargetStableSinceAt) observedTargetStableSinceAt = now;
   } else {
     observedTargetStableSinceAt = 0;
-    suspendRdsGroupTrackingForOffTarget(activeFrequency, observed, now);
+    suspendRdsGroupTrackingForOffTarget(activeFrequency, observed);
   }
 }
 
@@ -1537,6 +1770,7 @@ function receiverBoolean(value) {
 }
 
 function applyReceiverOptionsAfterTune(reason) {
+  if (runtime.stopped) return;
   const commands = [];
   if (config.forceRetuneBandwidthHz !== 'keep') {
     commands.push(`W${config.forceRetuneBandwidthHz}`);
@@ -1566,6 +1800,7 @@ function applyReceiverOptionsAfterTune(reason) {
 }
 
 function tuneTo(freq, reason = 'scheduled', options = {}) {
+  if (runtime.stopped) return;
   const mhz = Number(freq);
   if (!Number.isFinite(mhz)) return;
 
@@ -1588,6 +1823,7 @@ function tuneTo(freq, reason = 'scheduled', options = {}) {
   const command = `T${Math.round(mhz * 1000)}`;
   Promise.resolve(pluginsApi.sendPrivilegedCommand(command, true))
     .then(ok => {
+      if (runtime.stopped) return;
       if (ok) {
         resetRdsGroupTrackingForFrequency(key);
         logDebug(`Tuned to ${key} MHz (${reason})`);
@@ -1600,14 +1836,14 @@ function tuneTo(freq, reason = 'scheduled', options = {}) {
 }
 
 function chooseNextFrequency(now) {
-  const freqs = normalizeFrequencies(config.frequencies);
+  const freqs = Array.isArray(config.frequencies) ? config.frequencies : [];
   if (!freqs.length) return null;
 
   if (!activeFrequency) {
     activeFrequency = freqs[0];
     activeTuneStartedAt = now;
     offTargetSinceAt = 0;
-    resetObservedTargetStability(now);
+    resetObservedTargetStability();
     tuneTo(activeFrequency, 'initial target');
     return activeFrequency;
   }
@@ -1621,7 +1857,7 @@ function chooseNextFrequency(now) {
       activeFrequency = only;
       activeTuneStartedAt = now;
       offTargetSinceAt = 0;
-      resetObservedTargetStability(now);
+      resetObservedTargetStability();
       tuneTo(activeFrequency, 'single target changed');
     }
     return activeFrequency;
@@ -1632,14 +1868,14 @@ function chooseNextFrequency(now) {
     activeFrequency = freqs[freqIndex];
     activeTuneStartedAt = now;
     offTargetSinceAt = 0;
-    resetObservedTargetStability(now);
+    resetObservedTargetStability();
     tuneTo(activeFrequency, 'next target');
   }
   return activeFrequency;
 }
 
 function currentStatusPayload() {
-  const d = lastData || sanitizeReceiverData(dataHandler.dataToSend) || {}
+  const d = lastData || sanitizeReceiverData(dataHandler.dataToSend) || {};
   const activeState = activeFrequency ? states.get(frequencyKey(activeFrequency)) : null;
   const rdsGroupLastSeenAgeSeconds = activeState?.rdsGroupLastSeenAt
     ? Number(Math.max(0, (Date.now() - activeState.rdsGroupLastSeenAt) / 1000).toFixed(1))
@@ -1701,18 +1937,18 @@ function tick() {
     return;
   }
 
-  const settleMs = Math.max(0, Number(config.tuneSettleSeconds || 4)) * 1000;
+  const settleMs = Math.max(0, Number(config.tuneSettleSeconds)) * 1000;
   if ((now - activeTuneStartedAt) < settleMs) {
     sendPluginMessage('PushoverWatchdog:status', currentStatusPayload());
     return;
   }
 
-  const d = lastData || sanitizeReceiverData(dataHandler.dataToSend) || {}
+  const d = lastData || sanitizeReceiverData(dataHandler.dataToSend) || {};
   updateObservedFrequencyTracking(d, now);
   const observedFreq = Number(d.freq);
   const target = Number(targetFreq);
   if (!Number.isFinite(observedFreq) || Math.abs(observedFreq - target) > 0.015) {
-    suspendRdsGroupTrackingForOffTarget(targetFreq, observedFreq, now);
+    suspendRdsGroupTrackingForOffTarget(targetFreq, observedFreq);
     maybeForceRetune(targetFreq, observedFreq, now);
     sendPluginMessage('PushoverWatchdog:status', currentStatusPayload());
     return;
@@ -1743,7 +1979,7 @@ function maybeForceRetune(targetFreq, observedFreq, now) {
   lastForcedTuneAt = now;
   activeTuneStartedAt = now;
   offTargetSinceAt = 0;
-  resetObservedTargetStability(now);
+  resetObservedTargetStability();
   tuneTo(targetFreq, `forced retune after ${intervalSeconds}s grace, observed ${Number.isFinite(observedFreq) ? observedFreq.toFixed(3) : 'unknown'} MHz`, { force: true });
 }
 
@@ -1798,15 +2034,16 @@ function isStereoOn(data) {
 function updateStereoHistory(st, now, stereoOn, canCheckStereo) {
   if (!canCheckStereo) {
     st.stereoHistory = [];
-    st.stereoRecoverySince = 0;
     return { drops: 0, offSamples: 0, samples: 0 };
   }
 
   const windowMs = Math.max(1, Number(config.stereoWindowSeconds || 60)) * 1000;
   st.stereoHistory.push({ t: now, on: !!stereoOn });
-  st.stereoHistory = st.stereoHistory.filter(sample => now - sample.t <= windowMs);
+  let expiredCount = 0;
+  while (expiredCount < st.stereoHistory.length && now - st.stereoHistory[expiredCount].t > windowMs) expiredCount++;
+  if (expiredCount) st.stereoHistory.splice(0, expiredCount);
   if (st.stereoHistory.length > MAX_STEREO_HISTORY_SAMPLES) {
-    st.stereoHistory = st.stereoHistory.slice(-MAX_STEREO_HISTORY_SAMPLES);
+    st.stereoHistory.splice(0, st.stereoHistory.length - MAX_STEREO_HISTORY_SAMPLES);
   }
 
   let drops = 0;
@@ -1823,18 +2060,21 @@ function evaluateFrequency(freq, data, now) {
   const st = getState(freq);
   const signalRawDbf = Number(data.sig);
   const signal = signalFromRawDbf(signalRawDbf);
-  const signalOk = Number.isFinite(signal) && signal >= Number(config.signalThreshold || 20);
+  const signalOk = Number.isFinite(signal) && signal >= Number(config.signalThreshold);
   const audioFresh = currentAudio.lastUpdate && (now - currentAudio.lastUpdate < 10000);
   const audioDbfs = currentAudio.dbfs;
-  const audioSilent = audioFresh && Number.isFinite(audioDbfs) && audioDbfs <= Number(config.audioSilenceThresholdDbfs || -45);
+  const audioSilent = audioFresh && (audioDbfs === -Infinity || (Number.isFinite(audioDbfs) && audioDbfs <= Number(config.audioSilenceThresholdDbfs)));
   const canCheckBlank = audioFresh && (!config.requireCarrierForBlank || signalOk);
-  const rdsPresent = isRdsPresent(data);
   const canCheckRds = !config.requireCarrierForRds || signalOk;
   const stereoOn = isStereoOn(data);
   const canCheckStereo = !!config.stereoMonitorEnabled &&
     (!config.stereoRequireCarrier || signalOk) &&
     (!config.stereoRequireAudio || (audioFresh && !audioSilent)) &&
     (!config.stereoRequireRdsValid || hasValidRdsIdentity(data));
+
+  if (config.rdsGroupRequireCarrier && !signalOk) {
+    resetRdsGroupInterruptionState(st);
+  }
 
   // Signal-below-threshold / white-noise condition.
   if (!signalOk) {
@@ -1915,7 +2155,6 @@ function evaluateFrequency(freq, data, now) {
       const wasAlerted = st.stereoAlerted;
       st.stereoAlerted = true;
       st.lastStereoAlert = now;
-      st.stereoRecoverySince = 0;
       sendAlert('stereoUnstable', freq, data, activeAlertReason(`Stereo indicator unstable/off: ${stereoStats.drops} drop(s), ${stereoStats.offSamples} off sample(s) in the last ${Math.round(Number(config.stereoWindowSeconds || 60))} seconds.`, wasAlerted, Math.round(Number(config.stereoWindowSeconds || 60))));
     }
   }
@@ -1947,9 +2186,8 @@ function evaluateFrequency(freq, data, now) {
       st.noCarrierSince = 0;
       st.rdsMissingSince = 0;
       st.rdsGroupMissingSince = 0;
-      st.rdsGroupUnreadableStreak = 0;
+      resetRdsGroupInterruptionState(st);
       st.blankSince = 0;
-      st.stereoRecoverySince = 0;
       st.recoverySince = 0;
 
       if (config.sendRecoveryNotifications && cooldownOk(st.lastRecoveryAlert, now)) {
@@ -1963,7 +2201,7 @@ function evaluateFrequency(freq, data, now) {
 }
 
 function cooldownOk(lastAlert, now) {
-  const cooldown = Math.max(0, Number(config.alertCooldownMinutes || 10)) * 60000;
+  const cooldown = Math.max(0, Number(config.alertCooldownMinutes)) * 60000;
   return !lastAlert || (now - lastAlert) >= cooldown;
 }
 
@@ -2040,16 +2278,16 @@ function notificationPayload(title, message, kind, freq) {
 function sendTestNotification(channel) {
   const title = 'FM-DX Watchdog test';
   const message = 'Test notification from FM Monitor.';
-  if (channel === 'pushover') return sendPushover(title, message, 'test');
-  if (channel === 'telegram') return sendTelegram(title, message, 'test');
+  if (channel === 'pushover') return sendPushover(title, message);
+  if (channel === 'telegram') return sendTelegram(title, message);
   if (channel === 'zabbix') return sendZabbix(title, message, 'test');
   return Promise.reject(new Error('Unknown notification channel.'));
 }
 
 function dispatchNotifications(title, message, kind, freq) {
   const tasks = [];
-  if (config.pushoverEnabled) tasks.push({ channel: 'pushover', promise: sendPushover(title, message, kind) });
-  if (config.telegramEnabled) tasks.push({ channel: 'telegram', promise: sendTelegram(title, message, kind) });
+  if (config.pushoverEnabled) tasks.push({ channel: 'pushover', promise: sendPushover(title, message) });
+  if (config.telegramEnabled) tasks.push({ channel: 'telegram', promise: sendTelegram(title, message) });
   if (config.zabbixEnabled) tasks.push({ channel: 'zabbix', promise: sendZabbix(title, message, kind, freq) });
   if (!tasks.length) {
     logDebug(`Alert ${kind} was detected, but all notification channels are disabled.`);
@@ -2057,8 +2295,12 @@ function dispatchNotifications(title, message, kind, freq) {
   }
   for (const task of tasks) {
     task.promise
-      .then(() => logInfo(`[${PLUGIN_NAME}] ${channelLabel(task.channel)} alert sent: ${kind}${Number.isFinite(Number(freq)) ? ` ${frequencyKey(freq)} MHz` : ''}.`))
-      .catch(err => logError(`[${PLUGIN_NAME}] ${channelLabel(task.channel)} alert failed: ${err.message}`));
+      .then(() => {
+        if (!runtime.stopped) logInfo(`[${PLUGIN_NAME}] ${channelLabel(task.channel)} alert sent: ${kind}${Number.isFinite(Number(freq)) ? ` ${frequencyKey(freq)} MHz` : ''}.`);
+      })
+      .catch(err => {
+        if (!runtime.stopped) logError(`[${PLUGIN_NAME}] ${channelLabel(task.channel)} alert failed: ${safeErrorMessage(err)}`);
+      });
   }
 }
 
@@ -2068,38 +2310,26 @@ function truncateText(value, maxChars) {
   return text.slice(0, Math.max(0, maxChars - 1)) + '…';
 }
 
-function sendPushover(title, message, kind) {
+function postFormUrlEncoded({ hostname, path: requestPath, body, label }) {
+  if (runtime.stopped) return Promise.reject(new Error('Pushover Watchdog runtime stopped.'));
   return new Promise((resolve, reject) => {
     let settled = false;
+    let cleanup = null;
+    let deadlineTimer = null;
     const finish = (error, value) => {
       if (settled) return;
       settled = true;
-      if (error) reject(error); else resolve(value);
+      runtimeClearTimer(deadlineTimer);
+      deadlineTimer = null;
+      if (cleanup) runtime.cleanups.delete(cleanup);
+      if (error) reject(error);
+      else resolve(value);
     };
-    if (!config.pushoverUserKey || !config.pushoverApiToken) {
-      finish(new Error('Pushover User Key or API Token is missing.'));
-      return;
-    }
 
-    const payload = new URLSearchParams();
-    payload.set('token', config.pushoverApiToken);
-    payload.set('user', config.pushoverUserKey);
-    payload.set('title', title);
-    payload.set('message', truncateText(message, MAX_PUSHOVER_MESSAGE_CHARS));
-    const priority = Math.max(-2, Math.min(2, Math.trunc(Number(config.pushoverPriority ?? 0))));
-    payload.set('priority', String(priority));
-    if (priority === 2) {
-      payload.set('retry', String(Math.max(30, Math.trunc(Number(config.pushoverRetrySeconds || 60)))));
-      payload.set('expire', String(Math.max(30, Math.trunc(Number(config.pushoverExpireSeconds || 1800)))));
-    }
-    if (config.pushoverDevice) payload.set('device', config.pushoverDevice);
-    if (config.pushoverSound) payload.set('sound', config.pushoverSound);
-
-    const body = payload.toString();
     const req = https.request({
       method: 'POST',
-      hostname: 'api.pushover.net',
-      path: '/1/messages.json',
+      hostname,
+      path: requestPath,
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Content-Length': Buffer.byteLength(body)
@@ -2110,79 +2340,90 @@ function sendPushover(title, message, kind) {
       let responseBytes = 0;
       res.on('data', chunk => {
         responseBytes += chunk.length || Buffer.byteLength(String(chunk));
-        if (responseBytes <= MAX_NOTIFICATION_RESPONSE_BYTES) {
-          response += chunk.toString();
+        if (responseBytes > MAX_NOTIFICATION_RESPONSE_BYTES) {
+          finish(new Error(`${label} response exceeded the safety limit.`));
+          res.destroy();
+          return;
         }
+        response += chunk.toString();
       });
       res.on('end', () => {
         if (res.statusCode >= 200 && res.statusCode < 300) finish(null, response);
         else finish(new Error(`HTTP ${res.statusCode}: ${truncateText(response, 512)}`));
       });
-      res.on('aborted', () => finish(new Error('Pushover response was aborted before completion.')));
+      res.on('aborted', () => finish(new Error(`${label} response was aborted before completion.`)));
       res.on('error', err => finish(err));
     });
-    req.on('timeout', () => req.destroy(new Error('Pushover request timeout')));
+    req.on('timeout', () => req.destroy(new Error(`${label} request timeout`)));
     req.on('error', err => finish(err));
+    deadlineTimer = runtimeSetTimeout(() => {
+      const error = new Error(`${label} request exceeded the total time limit.`);
+      finish(error);
+      req.destroy(error);
+    }, NOTIFICATION_TOTAL_TIMEOUT_MS);
+    cleanup = runtimeAddCleanup(() => {
+      const error = new Error('Pushover Watchdog runtime stopped.');
+      finish(error);
+      req.destroy(error);
+    });
     req.write(body);
     req.end();
   });
 }
 
-function sendTelegram(title, message, kind) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const finish = (error, value) => {
-      if (settled) return;
-      settled = true;
-      if (error) reject(error); else resolve(value);
-    };
-    if (!config.telegramBotToken || !config.telegramChatId) {
-      finish(new Error('Telegram Bot Token or Chat ID is missing.'));
-      return;
-    }
-    if (!/^[0-9]+:[A-Za-z0-9_-]+$/.test(config.telegramBotToken)) {
-      finish(new Error('Telegram Bot Token format is invalid.'));
-      return;
-    }
+function sendPushover(title, message) {
+  if (!config.pushoverUserKey || !config.pushoverApiToken) {
+    return Promise.reject(new Error('Pushover User Key or API Token is missing.'));
+  }
 
-    const payload = new URLSearchParams();
-    payload.set('chat_id', config.telegramChatId);
-    payload.set('text', truncateText(`${title}\n\n${message}`, MAX_TELEGRAM_MESSAGE_CHARS));
-    payload.set('disable_web_page_preview', 'true');
-    if (config.telegramThreadId) payload.set('message_thread_id', config.telegramThreadId);
+  const payload = new URLSearchParams();
+  payload.set('token', config.pushoverApiToken);
+  payload.set('user', config.pushoverUserKey);
+  payload.set('title', title);
+  payload.set('message', truncateText(message, MAX_PUSHOVER_MESSAGE_CHARS));
+  const priority = Math.max(-2, Math.min(2, Math.trunc(Number(config.pushoverPriority ?? 0))));
+  payload.set('priority', String(priority));
+  if (priority === 2) {
+    const retry = Math.min(MAX_PUSHOVER_EMERGENCY_SECONDS, Math.max(30, Math.trunc(Number(config.pushoverRetrySeconds || 60))));
+    const expire = Math.min(MAX_PUSHOVER_EMERGENCY_SECONDS, Math.max(retry, Math.trunc(Number(config.pushoverExpireSeconds || 1800))));
+    payload.set('retry', String(retry));
+    payload.set('expire', String(expire));
+  }
+  if (config.pushoverDevice) payload.set('device', config.pushoverDevice);
+  if (config.pushoverSound) payload.set('sound', config.pushoverSound);
 
-    const body = payload.toString();
-    const req = https.request({
-      method: 'POST',
-      hostname: 'api.telegram.org',
-      path: `/bot${config.telegramBotToken}/sendMessage`,
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(body)
-      },
-      timeout: 10000
-    }, (res) => {
-      let response = '';
-      let responseBytes = 0;
-      res.on('data', chunk => {
-        responseBytes += chunk.length || Buffer.byteLength(String(chunk));
-        if (responseBytes <= MAX_NOTIFICATION_RESPONSE_BYTES) response += chunk.toString();
-      });
-      res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) finish(null, response);
-        else finish(new Error(`HTTP ${res.statusCode}: ${truncateText(response, 512)}`));
-      });
-      res.on('aborted', () => finish(new Error('Telegram response was aborted before completion.')));
-      res.on('error', err => finish(err));
-    });
-    req.on('timeout', () => req.destroy(new Error('Telegram request timeout')));
-    req.on('error', err => finish(err));
-    req.write(body);
-    req.end();
+  return postFormUrlEncoded({
+    hostname: 'api.pushover.net',
+    path: '/1/messages.json',
+    body: payload.toString(),
+    label: 'Pushover'
+  });
+}
+
+function sendTelegram(title, message) {
+  if (!config.telegramBotToken || !config.telegramChatId) {
+    return Promise.reject(new Error('Telegram Bot Token or Chat ID is missing.'));
+  }
+  if (!/^[0-9]+:[A-Za-z0-9_-]+$/.test(config.telegramBotToken)) {
+    return Promise.reject(new Error('Telegram Bot Token format is invalid.'));
+  }
+
+  const payload = new URLSearchParams();
+  payload.set('chat_id', config.telegramChatId);
+  payload.set('text', truncateText(`${title}\n\n${message}`, MAX_TELEGRAM_MESSAGE_CHARS));
+  payload.set('link_preview_options', JSON.stringify({ is_disabled: true }));
+  if (config.telegramThreadId) payload.set('message_thread_id', config.telegramThreadId);
+
+  return postFormUrlEncoded({
+    hostname: 'api.telegram.org',
+    path: `/bot${config.telegramBotToken}/sendMessage`,
+    body: payload.toString(),
+    label: 'Telegram'
   });
 }
 
 function sendZabbix(title, message, kind, freq) {
+  if (runtime.stopped) return Promise.reject(new Error('Pushover Watchdog runtime stopped.'));
   return new Promise((resolve, reject) => {
     if (!config.zabbixServer || !config.zabbixHost || !config.zabbixKey) {
       reject(new Error('Zabbix server, host name or trapper key is missing.'));
@@ -2200,21 +2441,26 @@ function sendZabbix(title, message, kind, freq) {
       }]
     }), 'utf8');
     const header = Buffer.alloc(13);
-    header.write('ZBXD\x01', 0, 'binary');
+    header.write('ZBXD\x01', 0, 'latin1');
     header.writeBigUInt64LE(BigInt(requestPayload.length), 5);
     const socket = net.createConnection({ host: config.zabbixServer, port: config.zabbixPort });
     let response = Buffer.alloc(0);
     let settled = false;
+    let cleanup = null;
+    let deadlineTimer = null;
 
     const finish = (error, value) => {
       if (settled) return;
       settled = true;
+      runtimeClearTimer(deadlineTimer);
+      deadlineTimer = null;
+      if (cleanup) runtime.cleanups.delete(cleanup);
       try { socket.destroy(); } catch (_) {}
       if (error) reject(error); else resolve(value);
     };
 
     const parseResponseIfComplete = () => {
-      if (response.length < 13 || response.subarray(0, 5).toString('binary') !== 'ZBXD\x01') return false;
+      if (response.length < 13 || response.subarray(0, 5).toString('latin1') !== 'ZBXD\x01') return false;
       const expectedLength = Number(response.readBigUInt64LE(5));
       if (!Number.isSafeInteger(expectedLength) || expectedLength < 0 || expectedLength > MAX_NOTIFICATION_RESPONSE_BYTES) {
         finish(new Error('Invalid or oversized Zabbix response.'));
@@ -2258,6 +2504,11 @@ function sendZabbix(title, message, kind, freq) {
     socket.on('close', () => {
       if (!settled) finish(new Error('Zabbix connection closed before a complete response.'));
     });
+    deadlineTimer = runtimeSetTimeout(
+      () => finish(new Error('Zabbix request exceeded the total time limit.')),
+      NOTIFICATION_TOTAL_TIMEOUT_MS
+    );
+    cleanup = runtimeAddCleanup(() => finish(new Error('Pushover Watchdog runtime stopped.')));
   });
 }
 
@@ -2268,6 +2519,6 @@ connectTextWebSocket();
 if (config.enabled && config.rdsGroupMonitoringEnabled) connectRdsGroupWebSocket();
 registerPluginWebSocketAuthHandlers();
 runtimeSetInterval(tick, 1000);
-runtimeSetInterval(() => pruneRadioTextLog(Date.now(), true), RT_LOG_CLEANUP_INTERVAL_MS);
+runtimeSetInterval(() => pruneRadioTextLog(Date.now(), false), RT_LOG_CLEANUP_INTERVAL_MS);
 
 logInfo(`[${PLUGIN_NAME}] Loaded. Config: ${CONFIG_PATH}`);

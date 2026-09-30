@@ -51,5 +51,6 @@
   "debugLogging": false,
   "rdsGroupMonitoringEnabled": false,
   "rdsGroupMissingSeconds": 10,
+  "rdsGroupInterruptionEventsPerMinute": 1,
   "rdsGroupRequireCarrier": true
 }

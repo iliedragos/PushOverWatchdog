@@ -14,7 +14,7 @@ The plugin is designed for FM monitoring setups using TEF / Headless TEF receive
 - Blank audio / no modulation detection
 - Missing valid RDS detection
 - Sudden RDS group-stream loss detection (optional)
-- Short RDS group decoding-interruption detection (`--` gaps after 4 consecutive unreadable groups)
+- Short RDS group decoding-interruption detection (`--` gaps after 4 consecutive unreadable groups), with a configurable interruption-events-per-minute trigger
 - Stereo indicator instability detection
 - Recovery notifications
 - Pushover, Telegram & Zabbix alert integration
@@ -248,15 +248,18 @@ If the receiver is temporarily tuned away from the configured watchdog frequency
 {
   "rdsGroupMonitoringEnabled": true,
   "rdsGroupMissingSeconds": 10,
+  "rdsGroupInterruptionEventsPerMinute": 1,
   "rdsGroupRequireCarrier": true
 }
 ```
 
 The default of 10 seconds is intended to catch a real interruption without reacting to a short decode glitch. The plugin does not treat a broken local `/rds` WebSocket as a transmitter fault: when that source is unavailable, group-loss alerting is paused until the connection returns and a new baseline is observed.
 
-The same monitor also detects **short decoding interruptions** that are visible in RDS Expert as consecutive `--` group entries. Once the normal three-group baseline is armed, the plugin raises an **RDS group interruption** alert when it receives **4 consecutive raw RDS frames whose block B is unreadable (`----`)**. One to three isolated unreadable frames are ignored, and the counter is reset as soon as a usable group is decoded again.
+The same monitor also detects **short decoding interruptions** that are visible in RDS Expert as consecutive `--` group entries. The base event remains deliberately strict: after the normal three-group baseline is armed, **4 consecutive raw RDS frames whose block B is unreadable (`----`)** create one interruption event. One to three isolated unreadable frames are ignored, and a usable group resets the four-frame streak.
 
-This short-interruption check follows the same target-frequency safeguards as the long-duration monitor: it is ignored while the receiver is temporarily tuned away from the configured watchdog frequency, during the target-settle period, when the local `/rds` source is unavailable, and—when enabled—while the RF signal is below the configured carrier threshold.
+`rdsGroupInterruptionEventsPerMinute` controls how many **distinct** base interruption events must occur inside a rolling 60-second window before the plugin sends an **RDS group interruption** alert. The default is `1`, which preserves the v1.0.4 behaviour. For example, a value of `3` means the watchdog must observe three separate four-frame interruptions within 60 seconds. A continuous run of 12 unreadable frames is still only one interruption event because a usable group must appear before another event can begin. Values are normalized by the server to an integer between 1 and 600.
+
+This short-interruption check follows the same target-frequency safeguards as the long-duration monitor: it is ignored while the receiver is temporarily tuned away from the configured watchdog frequency, during the target-settle period, when the local `/rds` source is unavailable, and—when enabled—while the RF signal is below the configured carrier threshold. The rolling interruption history is cleared whenever those safeguards suspend/reset RDS group tracking, preventing stale events from being reused after monitoring resumes.
 
 ---
 
@@ -335,13 +338,14 @@ RadioText A/B sequences are tracked separately, which prevents repetitive entrie
 
 ## Security Notes
 
-The configuration panel is available only for authenticated users.
+The configuration panel and RadioText history are available only to administrator-authenticated FM-DX sessions.
+Notification credentials remain server-side in `plugins_configs/PushoverWatchdog.json` and are not returned through the shared plugin WebSocket.
 
-Unauthenticated users cannot:
+Unauthenticated/non-admin users cannot:
 
 - Open the FM Monitor configuration panel
-- Read the plugin configuration
-- View Pushover keys or tokens
+- Read the plugin configuration or RadioText history
+- Receive Pushover/Telegram credentials through the plugin UI
 - Save configuration changes
 - Send test notifications
 

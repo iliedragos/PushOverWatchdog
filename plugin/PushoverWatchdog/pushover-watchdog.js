@@ -10,6 +10,7 @@
     observers: new Set(),
     stopped: false,
     stop() {
+      if (this.stopped) return;
       this.stopped = true;
       for (const timer of this.timers) {
         try { clearTimeout(timer); clearInterval(timer); } catch (_) {}
@@ -20,13 +21,8 @@
       }
       this.observers.clear();
       try { document.removeEventListener('DOMContentLoaded', boot); } catch (_) {}
-      try { if (ws) ws.close(); } catch (_) {}
-      ws = null;
-      // Drop DOM nodes carrying handlers from an older hot-loaded copy.
-      ['pushover-watchdog-button', 'pushover-watchdog-rtlog-button', 'pushover-watchdog-modal', 'pushover-watchdog-rtlog-modal'].forEach(id => {
-        const node = document.getElementById(id);
-        if (node) node.remove();
-      });
+      // Share logout teardown so retired copies release socket, UI and log data.
+      deactivateAdminUi();
     }
   };
   window[runtimeKey] = runtime;
@@ -58,12 +54,16 @@
   }
 
   const pluginName = 'Pushover Watchdog';
-  const pluginVersion = '1.0.4';
+  const pluginVersion = '1.0.5';
   const pluginAuthor = 'by Play Radio Constanta';
+  const maxPluginMessageBytes = 65536;
+  const maxRtLogPageSize = 250;
+  const adminSessionCheckMs = 5000;
   let config = null;
   let status = null;
   let ws = null;
   let wsReconnectTimer = null;
+  let channelToken = null;
   let rtLogEntries = [];
   let rtLogHasMore = false;
   let rtLogBefore = null;
@@ -75,13 +75,13 @@
   }
 
   function isAdminAuthenticated() {
+    // Prefer the dedicated admin control because it avoids scanning the complete
+    // dashboard text on the common authenticated path. Keep the text fallback for
+    // FM-DX builds/themes where that control is not present.
+    if (document.querySelector('#dashboard-lock-admin')) return true;
     const bodyText = document.body ? (document.body.textContent || document.body.innerText || '') : '';
-
-    // Settings contain alert destinations and operational information. Keep this
-    // panel aligned with the backend: administrator sessions only, not tune-only users.
     return bodyText.includes('You are logged in as an administrator.') ||
-      bodyText.includes('You are logged in as an adminstrator.') ||
-      !!document.querySelector('#dashboard-lock-admin');
+      bodyText.includes('You are logged in as an adminstrator.');
   }
 
   function connect() {
@@ -91,38 +91,57 @@
       runtimeClearTimer(wsReconnectTimer);
       wsReconnectTimer = null;
     }
-    ws = new WebSocket(wsUrl());
-    ws.addEventListener('open', () => {
+    const socket = new WebSocket(wsUrl());
+    ws = socket;
+    socket.addEventListener('open', () => {
+      if (runtime.stopped || ws !== socket || !isAdminAuthenticated()) return;
       send('PushoverWatchdog:getConfig', {});
     });
-    ws.addEventListener('message', (event) => {
+    socket.addEventListener('message', (event) => {
+      if (runtime.stopped || ws !== socket || !isAdminAuthenticated()) return;
+      if (typeof event.data !== 'string' || event.data.length > maxPluginMessageBytes) return;
       let msg;
       try { msg = JSON.parse(event.data); } catch (_) { return; }
-      if (!msg || typeof msg !== 'object') return;
+      if (!isPlainObject(msg) || typeof msg.type !== 'string') return;
+
+      if (msg.type === 'PushoverWatchdog:channel') {
+        const token = isPlainObject(msg.value) ? String(msg.value.token || '') : '';
+        if (!channelToken && /^[A-Za-z0-9_-]{32,128}$/.test(token)) channelToken = token;
+        return;
+      }
+      // FM-DX's /data_plugins endpoint rebroadcasts browser-originated plugin
+      // messages to every plugin client. Accept privileged plugin responses only
+      // when they carry the per-connection token issued directly by the backend.
+      if (!channelToken || msg.channelToken !== channelToken) return;
 
       if (msg.type === 'PushoverWatchdog:config') {
+        if (!isPlainObject(msg.value)) return;
         config = msg.value;
         renderModal();
       }
       if (msg.type === 'PushoverWatchdog:status') {
+        if (!isPlainObject(msg.value)) return;
         status = msg.value;
         renderStatus();
       }
       if (msg.type === 'PushoverWatchdog:rtLogPage') {
-        applyRtLogPage(msg.value || {});
+        if (!isPlainObject(msg.value)) return;
+        applyRtLogPage(msg.value);
       }
       if (msg.type === 'PushoverWatchdog:rtLogChanged') {
-        if (document.getElementById('pushover-watchdog-rtlog-modal') && !document.getElementById('pushover-watchdog-rtlog-modal').classList.contains('hidden')) {
-          requestRtLog(true);
-        }
+        const rtLogModal = document.getElementById('pushover-watchdog-rtlog-modal');
+        if (rtLogModal && !rtLogModal.classList.contains('hidden')) requestRtLog(true);
       }
       if (msg.type === 'PushoverWatchdog:toast') {
-        toast(msg.value?.level || 'info', msg.value?.message || 'Pushover Watchdog update');
+        if (!isPlainObject(msg.value)) return;
+        toast(msg.value.level || 'info', msg.value.message || 'Pushover Watchdog update');
       }
     });
-    ws.addEventListener('close', () => {
+    socket.addEventListener('close', () => {
+      if (ws !== socket) return;
       ws = null;
-      if (runtime.stopped) return;
+      channelToken = null;
+      if (runtime.stopped || !isAdminAuthenticated()) return;
       if (!wsReconnectTimer) {
         wsReconnectTimer = runtimeSetTimeout(() => {
           wsReconnectTimer = null;
@@ -134,7 +153,10 @@
 
   function send(type, value) {
     const payload = JSON.stringify({ type, value });
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(payload);
+    if (runtime.stopped || !isAdminAuthenticated()) return;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(payload); } catch (_) {}
+    }
   }
 
   function toast(level, message) {
@@ -148,6 +170,10 @@
 
   function safeText(value, maxChars = 512) {
     return String(value ?? '').replace(/[\u0000-\u001F\u007F]/g, '').slice(0, Math.max(0, maxChars));
+  }
+
+  function isPlainObject(value) {
+    return !!value && typeof value === 'object' && !Array.isArray(value);
   }
 
   function field(id, label, value, type = 'text', help = '') {
@@ -288,8 +314,8 @@
           ${field('pwd-device', 'Device (optional)', config.pushoverDevice)}
           ${field('pwd-sound', 'Sound', config.pushoverSound)}
           ${field('pwd-priority', 'Priority', config.pushoverPriority, 'number', 'Use 2 only for Emergency alerts; retry and expire are required then.')}
-          ${field('pwd-retry', 'Emergency retry seconds', config.pushoverRetrySeconds ?? 60, 'number', 'Only used when Priority is 2. Minimum accepted by Pushover: 30 seconds.')}
-          ${field('pwd-expire', 'Emergency expire seconds', config.pushoverExpireSeconds ?? 1800, 'number', 'Only used when Priority is 2. Example: 1800 = repeat for 30 minutes.')}
+          ${field('pwd-retry', 'Emergency retry seconds', config.pushoverRetrySeconds ?? 60, 'number', 'Only used when Priority is 2. Minimum: 30 seconds; normalized to a maximum of 10800 seconds.')}
+          ${field('pwd-expire', 'Emergency expire seconds', config.pushoverExpireSeconds ?? 1800, 'number', 'Only used when Priority is 2. Maximum accepted by Pushover: 10800 seconds (3 hours).')}
         </div>
         <div class="pwd-inline-actions"><button id="pwd-test-pushover" class="pwd-secondary">Test Pushover</button></div>
 
@@ -313,7 +339,7 @@
         <h3>Frequencies and timing</h3>
         <label class="pwd-field pwd-wide">
           <span>Frequencies to check</span>
-          <textarea id="pwd-frequencies" rows="3">${escapeHtml((config.frequencies || []).join(', '))}</textarea>
+          <textarea id="pwd-frequencies" rows="3">${escapeHtml((Array.isArray(config.frequencies) ? config.frequencies : []).join(', '))}</textarea>
           <small>Use MHz values separated by comma/space, for example: 91.600, 96.200, 101.100</small>
         </label>
         <div class="pwd-grid">
@@ -338,6 +364,7 @@
           ${field('pwd-no-carrier-seconds', 'Signal-below-threshold duration seconds', config.noCarrierSeconds, 'number')}
           ${field('pwd-rds-missing-seconds', 'RDS missing duration seconds', config.rdsMissingSeconds, 'number', 'Alert when no valid RDS identity (PI or PS) is decoded for this long while monitoring the target frequency.')}
           ${field('pwd-rds-group-missing-seconds', 'RDS group stream loss duration seconds', config.rdsGroupMissingSeconds, 'number', 'Arms only after three usable RDS groups are received at the current target. A usable group has a valid B block, so transient unreadable blocks do not count as normal traffic.')}
+          ${field('pwd-rds-group-interruption-events-per-minute', 'RDS group interruption events / minute', config.rdsGroupInterruptionEventsPerMinute ?? 1, 'number', 'Each event is 4 consecutive unreadable RDS groups (----). Alert only when this many distinct events occur inside a rolling 60-second window. Allowed range: 1-600. Default 1 preserves v1.0.4 behaviour.')}
           ${checkbox('pwd-rds-groups-require-carrier', 'RDS group stream monitoring requires carrier present', config.rdsGroupRequireCarrier)}
           ${field('pwd-blank-dbfs', 'Blank audio threshold dBFS', config.audioSilenceThresholdDbfs, 'number', 'Typical start: -45 dBFS. More negative = less sensitive.')}
           ${field('pwd-blank-seconds', 'Blank duration seconds', config.blankSeconds, 'number')}
@@ -466,6 +493,7 @@
       radioTextLoggingEnabled: document.getElementById('pwd-rtlog-enabled').checked,
       rdsGroupMonitoringEnabled: document.getElementById('pwd-rds-groups-enabled').checked,
       rdsGroupMissingSeconds: readNum('pwd-rds-group-missing-seconds', 10),
+      rdsGroupInterruptionEventsPerMinute: readNum('pwd-rds-group-interruption-events-per-minute', 1),
       rdsGroupRequireCarrier: document.getElementById('pwd-rds-groups-require-carrier').checked,
       frequencies,
       checkIntervalSeconds: readNum('pwd-interval', 2),
@@ -494,8 +522,7 @@
       recoverySeconds: readNum('pwd-recovery-seconds', 10),
       alertCooldownMinutes: readNum('pwd-cooldown', 10),
       sendRecoveryNotifications: document.getElementById('pwd-recovery').checked,
-      includeRdsInfo: document.getElementById('pwd-rds').checked,
-      debugLogging: false
+      includeRdsInfo: document.getElementById('pwd-rds').checked
     };
     send('PushoverWatchdog:saveConfig', next);
   }
@@ -506,32 +533,32 @@
       modal = document.createElement('div');
       modal.id = 'pushover-watchdog-rtlog-modal';
       modal.className = 'pwd-modal hidden';
-      document.body.appendChild(modal);
-    }
-    modal.innerHTML = `
-      <div class="pwd-card pwd-rtlog-card">
-        <div class="pwd-header">
-          <div>
-            <h2><i class="fa-solid fa-scroll"></i>&nbsp; RadioText log</h2>
-            <div class="pwd-subtitle">Rolling retention: the most recent 7 days only. Each settled RadioText A/B sequence is stored only when its text changes.</div>
+      modal.innerHTML = `
+        <div class="pwd-card pwd-rtlog-card">
+          <div class="pwd-header">
+            <div>
+              <h2><i class="fa-solid fa-scroll"></i>&nbsp; RadioText log</h2>
+              <div class="pwd-subtitle">Rolling retention: the most recent 7 days only. Each settled RadioText A/B sequence is stored only when its text changes.</div>
+            </div>
+            <button id="pwd-rtlog-close" class="pwd-icon-btn" aria-label="Close">×</button>
           </div>
-          <button id="pwd-rtlog-close" class="pwd-icon-btn" aria-label="Close">×</button>
-        </div>
-        <div class="pwd-inline-actions pwd-rtlog-actions">
-          <button id="pwd-rtlog-refresh" class="pwd-secondary">Refresh</button>
-          <button id="pwd-rtlog-older" class="pwd-secondary">Load older</button>
-        </div>
-        <div class="pwd-rtlog-table-wrap">
-          <table class="pwd-rtlog-table">
-            <thead><tr><th>Date / time</th><th>Frequency</th><th>PI</th><th>PS</th><th>RadioText</th></tr></thead>
-            <tbody id="pwd-rtlog-body"></tbody>
-          </table>
-        </div>
-        <div id="pwd-rtlog-summary" class="pwd-subtitle"></div>
-      </div>`;
-    document.getElementById('pwd-rtlog-close').onclick = closeRtLogModal;
-    document.getElementById('pwd-rtlog-refresh').onclick = () => requestRtLog(true);
-    document.getElementById('pwd-rtlog-older').onclick = () => requestRtLog(false);
+          <div class="pwd-inline-actions pwd-rtlog-actions">
+            <button id="pwd-rtlog-refresh" class="pwd-secondary">Refresh</button>
+            <button id="pwd-rtlog-older" class="pwd-secondary">Load older</button>
+          </div>
+          <div class="pwd-rtlog-table-wrap">
+            <table class="pwd-rtlog-table">
+              <thead><tr><th>Date / time</th><th>Frequency</th><th>PI</th><th>PS</th><th>RadioText</th></tr></thead>
+              <tbody id="pwd-rtlog-body"></tbody>
+            </table>
+          </div>
+          <div id="pwd-rtlog-summary" class="pwd-subtitle"></div>
+        </div>`;
+      document.body.appendChild(modal);
+      document.getElementById('pwd-rtlog-close').onclick = closeRtLogModal;
+      document.getElementById('pwd-rtlog-refresh').onclick = () => requestRtLog(true);
+      document.getElementById('pwd-rtlog-older').onclick = () => requestRtLog(false);
+    }
     renderRtLogRows();
     return modal;
   }
@@ -561,7 +588,9 @@
       return;
     }
 
+    const fragment = document.createDocumentFragment();
     for (const entry of rtLogEntries) {
+      if (!isPlainObject(entry)) continue;
       const tr = document.createElement('tr');
       const values = [
         entry.timestamp ? new Date(entry.timestamp).toLocaleString() : '-',
@@ -576,8 +605,9 @@
         td.textContent = value;
         tr.appendChild(td);
       });
-      body.appendChild(tr);
+      fragment.appendChild(tr);
     }
+    body.appendChild(fragment);
   }
 
   function requestRtLog(reset) {
@@ -594,11 +624,13 @@
   }
 
   function applyRtLogPage(page) {
-    const entries = Array.isArray(page.entries) ? page.entries : [];
+    const entries = Array.isArray(page.entries)
+      ? page.entries.slice(0, maxRtLogPageSize).filter(isPlainObject)
+      : [];
     rtLogEntries = rtLogAppendNext ? rtLogEntries.concat(entries) : entries;
     rtLogAppendNext = false;
     rtLogHasMore = !!page.hasMore;
-    rtLogBefore = page.nextBefore || null;
+    rtLogBefore = typeof page.nextBefore === 'string' ? safeText(page.nextBefore, 64) : null;
     const modal = ensureRtLogModal();
     if (!modal.classList.contains('hidden')) modal.classList.remove('hidden');
   }
@@ -690,6 +722,13 @@
     });
   }
 
+  function removePluginUi() {
+    ['pushover-watchdog-button', 'pushover-watchdog-rtlog-button', 'pushover-watchdog-modal', 'pushover-watchdog-rtlog-modal', 'pushover-watchdog-css'].forEach(id => {
+      const node = document.getElementById(id);
+      if (node) node.remove();
+    });
+  }
+
   function addPanelButton(id, label, icon, tooltip, onClick) {
     const attachClick = () => {
       const btn = document.getElementById(id);
@@ -746,9 +785,27 @@
 
   let started = false;
 
+  function deactivateAdminUi() {
+    removePluginUi();
+    runtimeClearTimer(wsReconnectTimer);
+    wsReconnectTimer = null;
+    if (ws) {
+      try { ws.close(); } catch (_) {}
+      ws = null;
+    }
+    config = null;
+    status = null;
+    channelToken = null;
+    rtLogEntries = [];
+    rtLogHasMore = false;
+    rtLogBefore = null;
+    rtLogAppendNext = false;
+    started = false;
+  }
+
   function startWhenAuthenticated() {
     if (!isAdminAuthenticated()) {
-      removeButtons();
+      deactivateAdminUi();
       return;
     }
 
@@ -772,11 +829,28 @@
     const interval = runtimeSetInterval(startWhenAuthenticated, 1000);
     runtimeSetTimeout(() => runtimeClearTimer(interval), 30000);
 
+    // Keep a low-frequency session guard for the lifetime of the page. FM-DX's
+    // shared plugin WebSocket can otherwise stay open after the initial 30-second
+    // boot window if an administrator logs out without reloading the page.
+    runtimeSetInterval(startWhenAuthenticated, adminSessionCheckMs);
+
     if (document.body && typeof MutationObserver !== 'undefined') {
-      const observer = new MutationObserver(startWhenAuthenticated);
+      let observerRefreshTimer = null;
+      const observer = new MutationObserver(() => {
+        // DOM-heavy FM-DX views can emit many mutation records in one burst.
+        // Coalesce them into one auth/UI refresh while keeping the existing
+        // one-second polling fallback and 30-second observation window.
+        if (observerRefreshTimer) return;
+        observerRefreshTimer = runtimeSetTimeout(() => {
+          observerRefreshTimer = null;
+          startWhenAuthenticated();
+        }, 100);
+      });
       observer.observe(document.body, { childList: true, subtree: true });
       runtime.observers.add(observer);
       runtimeSetTimeout(() => {
+        runtimeClearTimer(observerRefreshTimer);
+        observerRefreshTimer = null;
         try { observer.disconnect(); } catch (_) {}
         runtime.observers.delete(observer);
       }, 30000);
