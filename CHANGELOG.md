@@ -2,6 +2,8 @@
 
 ## v1.0.6 - 2026-11-10
 
+- Removed provider-controlled HTTP error response bodies from Pushover/Telegram diagnostics to prevent reflected credentials from reaching logs or administrator test notifications; channel and HTTP status remain available. Added regression coverage for both providers, oversized responses and successful delivery.
+
 - Added timed frontend reconnect after temporary admission pressure and kept unrelated plugin listeners intact when preparse traffic limits detach Watchdog processing.
 - Bounded shared-WebSocket actions to one active worker and eight queued actions per client, with global action/session, queue, frame/byte and plugin-attachment budgets.
 - Added a 256 KiB outbound buffer ceiling and immediate cleanup for flooding or slow-reading clients. Isolated oversized shared frames remain ignored; repeated excess traffic is limited before JSON parsing.

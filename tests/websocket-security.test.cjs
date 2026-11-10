@@ -53,7 +53,7 @@ function harness(t, options = {}) {
     }
   };
   vm.createContext(sandbox);
-  vm.runInContext(source + '\n globalThis.testApi = { runtime, sendPluginMessageTo, sendPluginMessage, pluginClientMessageHandlers, stats: () => ({ active: pluginActiveActions, pending: pluginPendingActions }) };', sandbox, { filename: backend });
+  vm.runInContext(source + '\n globalThis.testApi = { runtime, sendTestNotification, dispatchNotifications, sendPluginMessageTo, sendPluginMessage, pluginClientMessageHandlers, stats: () => ({ active: pluginActiveActions, pending: pluginPendingActions }) };', sandbox, { filename: backend });
   t.after(() => { sandbox.testApi.runtime.stop(); fs.rmSync(dir, { recursive: true, force: true }); });
   function connect(session = {}, headers = {}) {
     const client = new Socket();
@@ -417,3 +417,60 @@ test('generic preparse pressure detaches only Watchdog and preserves other liste
   assert.equal(delivered, 201);
   assert.equal(client.listenerCount('message'), 1);
 });
+
+// Provider-controlled bodies must never enter errors, logs or browser replies.
+for (const channel of ['pushover', 'telegram']) {
+  test(`${channel} reflected credentials stay out of notification diagnostics`, async t => {
+    const secrets = ['synthetic-user-secret', 'synthetic-api-secret', '123456:synthetic-bot-secret'];
+    const requests = [];
+    const h = harness(t, {
+      config: {
+        pushoverEnabled: channel === 'pushover', telegramEnabled: channel === 'telegram',
+        pushoverUserKey: secrets[0], pushoverApiToken: secrets[1],
+        telegramBotToken: secrets[2], telegramChatId: '123456'
+      },
+      modules: { https: { request(_options, onResponse) {
+        const req = new EventEmitter();
+        req.write = () => {};
+        req.end = () => {};
+        req.destroy = error => { if (error) req.emit('error', error); };
+        requests.push((status, body) => {
+          const res = new EventEmitter();
+          res.statusCode = status;
+          res.destroy = () => {};
+          onResponse(res);
+          res.emit('data', Buffer.from(body));
+          res.emit('end');
+        });
+        return req;
+      } } }
+    });
+    const reflected = JSON.stringify({ error: secrets.join('\n'), path: `/bot${secrets[2]}/sendMessage` });
+    const failure = h.sendTestNotification(channel);
+    requests.shift()(401, reflected);
+    await assert.rejects(failure, error => {
+      assert.match(error.message, /HTTP 401/);
+      for (const secret of secrets) assert.equal(error.message.includes(secret), false);
+      return true;
+    });
+    h.dispatchNotifications('Test', 'Message', 'test', 100);
+    requests.shift()(429, reflected);
+    await flush();
+    assert.ok(h.warnings.some(line => line.includes('HTTP 429')));
+    const { client } = h.connect({ isAdminAuthenticated: true });
+    client.emit('message', Buffer.from(JSON.stringify({ type: 'PushoverWatchdog:testChannel', value: { channel } })));
+    await flush();
+    requests.shift()(503, reflected);
+    await flush();
+    assert.ok(client.sent.some(x => x.type === 'PushoverWatchdog:toast' && x.value.level === 'error'));
+    const outputs = JSON.stringify({ warnings: h.warnings, sent: client.sent });
+    for (const secret of secrets) assert.equal(outputs.includes(secret), false);
+
+    const oversized = h.sendTestNotification(channel);
+    requests.shift()(500, reflected + 'x'.repeat(32769));
+    await assert.rejects(oversized, /safety limit/);
+    const success = h.sendTestNotification(channel);
+    requests.shift()(200, '{"ok":true}');
+    assert.equal(await success, '{"ok":true}');
+  });
+}
