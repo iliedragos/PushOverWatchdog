@@ -2474,7 +2474,9 @@ function postFormUrlEncoded({ hostname, path: requestPath, body, label }) {
       });
       res.on('end', () => {
         if (res.statusCode >= 200 && res.statusCode < 300) finish(null, response);
-        else finish(new Error(`HTTP ${res.statusCode}: ${truncateText(response, 512)}`));
+        // Providers know the request credentials and may reflect them in any
+        // response field. Keep their bodies out of logs and browser diagnostics.
+        else finish(new Error(`${label} HTTP ${res.statusCode}`));
       });
       res.on('aborted', () => finish(new Error(`${label} response was aborted before completion.`)));
       res.on('error', err => finish(err));
