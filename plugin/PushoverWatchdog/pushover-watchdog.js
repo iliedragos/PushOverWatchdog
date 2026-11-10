@@ -54,7 +54,7 @@
   }
 
   const pluginName = 'Pushover Watchdog';
-  const pluginVersion = '1.0.5';
+  const pluginVersion = '1.0.6';
   const pluginAuthor = 'by Play Radio Constanta';
   const maxPluginMessageBytes = 65536;
   const maxRtLogPageSize = 250;
@@ -63,6 +63,7 @@
   let status = null;
   let ws = null;
   let wsReconnectTimer = null;
+  let wsConfigTimer = null;
   let channelToken = null;
   let rtLogEntries = [];
   let rtLogHasMore = false;
@@ -95,6 +96,13 @@
     ws = socket;
     socket.addEventListener('open', () => {
       if (runtime.stopped || ws !== socket || !isAdminAuthenticated()) return;
+      // Admission may be declined temporarily under backend pressure. Retry
+      // this plugin-owned connection if its initial config never arrives.
+      runtimeClearTimer(wsConfigTimer);
+      wsConfigTimer = runtimeSetTimeout(() => {
+        wsConfigTimer = null;
+        if (ws === socket && !runtime.stopped) socket.close();
+      }, 10000);
       send('PushoverWatchdog:getConfig', {});
     });
     socket.addEventListener('message', (event) => {
@@ -116,6 +124,8 @@
 
       if (msg.type === 'PushoverWatchdog:config') {
         if (!isPlainObject(msg.value)) return;
+        runtimeClearTimer(wsConfigTimer);
+        wsConfigTimer = null;
         config = msg.value;
         renderModal();
       }
@@ -139,6 +149,8 @@
     });
     socket.addEventListener('close', () => {
       if (ws !== socket) return;
+      runtimeClearTimer(wsConfigTimer);
+      wsConfigTimer = null;
       ws = null;
       channelToken = null;
       if (runtime.stopped || !isAdminAuthenticated()) return;
@@ -789,6 +801,8 @@
     removePluginUi();
     runtimeClearTimer(wsReconnectTimer);
     wsReconnectTimer = null;
+    runtimeClearTimer(wsConfigTimer);
+    wsConfigTimer = null;
     if (ws) {
       try { ws.close(); } catch (_) {}
       ws = null;

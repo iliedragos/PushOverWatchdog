@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.0.6 - 2026-11-10
+
+- Added timed frontend reconnect after temporary admission pressure and kept unrelated plugin listeners intact when preparse traffic limits detach Watchdog processing.
+- Bounded shared-WebSocket actions to one active worker and eight queued actions per client, with global action/session, queue, frame/byte and plugin-attachment budgets.
+- Added a 256 KiB outbound buffer ceiling and immediate cleanup for flooding or slow-reading clients. Isolated oversized shared frames remain ignored; repeated excess traffic is limited before JSON parsing.
+- Throttled authentication rejection replies and aggregate warning logs, and canceled plugin authorization continuations/timers on disconnect or runtime shutdown.
+- Kept notification tests inside the bounded action pipeline instead of starting detached requests. Monitoring and automatic alert delivery are unchanged.
+- Added dependency-free Node.js regression tests for floods, session stalls/timeouts, pressure across connections, queue cleanup, admin reads/saves, logout and slow consumers.
+
 ## v1.0.5 - 2026-09-28
 
 - Added a configurable **RDS group interruption events / minute** threshold in the FM Monitor panel and `PushoverWatchdog.json`.
