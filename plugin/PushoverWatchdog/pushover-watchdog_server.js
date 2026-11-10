@@ -45,6 +45,16 @@ const RT_SEQUENCE_STATE_PATH = path.join(__dirname, '../../plugins_configs/Pusho
 const DBF_TO_DBUV_OFFSET = 11.25;
 const DBF_TO_DBM_OFFSET = 120;
 const MAX_PLUGIN_MESSAGE_BYTES = 65536;
+const MAX_PLUGIN_BUFFERED_BYTES = 256 * 1024;
+const MAX_PLUGIN_PENDING_ACTIONS = 8;
+const MAX_PLUGIN_TOTAL_PENDING_ACTIONS = 256;
+const MAX_PLUGIN_ACTIVE_ACTIONS = 64;
+const MAX_PLUGIN_CLIENTS = 512;
+const PLUGIN_REJECTION_INTERVAL_MS = 5000;
+const PLUGIN_ACTION_TYPES = new Set([
+  'PushoverWatchdog:getConfig', 'PushoverWatchdog:getRtLog',
+  'PushoverWatchdog:saveConfig', 'PushoverWatchdog:test', 'PushoverWatchdog:testChannel'
+]);
 const MAX_PUSHOVER_MESSAGE_CHARS = 950;
 const MAX_PUSHOVER_EMERGENCY_SECONDS = 10800;
 const MAX_TELEGRAM_MESSAGE_CHARS = 4000;
@@ -1186,7 +1196,14 @@ function sendPluginMessageTo(client, type, value) {
   if (type !== 'PushoverWatchdog:channel' && client.__pushoverWatchdogChannelToken) {
     message.channelToken = client.__pushoverWatchdogChannelToken;
   }
-  try { client.send(JSON.stringify(message)); } catch (_) {}
+  try {
+    const payload = JSON.stringify(message);
+    if (client.bufferedAmount + Buffer.byteLength(payload) > MAX_PLUGIN_BUFFERED_BYTES) {
+      disconnectPluginClient(client);
+      return;
+    }
+    client.send(payload);
+  } catch (_) {}
 }
 
 function ensurePluginClientChannel(client) {
@@ -1212,11 +1229,18 @@ function isAdminAuthenticatedWs(client) {
 }
 
 function rejectUnauthenticated(client, action) {
+  const state = pluginClientMessageHandlers.get(client)?.state;
+  const now = Date.now();
+  if (!state || now - state.lastRejectionAt < PLUGIN_REJECTION_INTERVAL_MS) return;
+  state.lastRejectionAt = now;
   sendPluginMessageTo(client, 'PushoverWatchdog:toast', {
     level: 'error',
     message: `Administrator login required to ${action}.`
   });
-  logWarn(`[${PLUGIN_NAME}] Rejected unauthenticated plugin action: ${action}.`);
+  // A shared budget also bounds logs when an attacker rotates connections.
+  if (takePluginBudget(pluginWarningBudget, 1, 0)) {
+    logWarn(`[${PLUGIN_NAME}] Rejected unauthenticated plugin action: ${action}.`);
+  }
 }
 
 function detachAudioMonitor() {
@@ -1543,9 +1567,77 @@ function isAllowedWebSocketOrigin(request) {
 }
 
 const pluginClientMessageHandlers = new Map();
+const pluginClientAuthCancellations = new WeakMap();
+let pluginPendingActions = 0;
+let pluginActiveActions = 0;
+
+function createPluginBudget(frames, bytes, seconds = 1) {
+  return { frames, bytes, maxFrames: frames, maxBytes: bytes, seconds, at: Date.now() };
+}
+
+function takePluginBudget(budget, frames, bytes) {
+  const now = Date.now();
+  const elapsed = Math.max(0, now - budget.at) / (1000 * budget.seconds);
+  budget.at = now;
+  budget.frames = Math.min(budget.maxFrames, budget.frames + elapsed * budget.maxFrames);
+  budget.bytes = Math.min(budget.maxBytes, budget.bytes + elapsed * budget.maxBytes);
+  if (budget.frames < frames || budget.bytes < bytes) return false;
+  budget.frames -= frames;
+  budget.bytes -= bytes;
+  return true;
+}
+
+// These budgets belong to this plugin; the shared WSS and its other listeners
+// remain owned by FM-DX. Host maxPayload/connection limits are still required.
+const pluginFrameBudget = createPluginBudget(2000, 16 * 1024 * 1024);
+const pluginActionBudget = createPluginBudget(128, 0, 2);
+const pluginConnectionBudget = createPluginBudget(128, 0, 2);
+const pluginWarningBudget = createPluginBudget(1, 0);
+
+function detachPluginClient(client) {
+  const handlers = pluginClientMessageHandlers.get(client);
+  if (handlers) {
+    client.off('message', handlers.message);
+    client.off('close', handlers.close);
+    pluginClientMessageHandlers.delete(client);
+    pluginPendingActions -= handlers.state.queue.length;
+    handlers.state.queue.length = 0;
+  }
+  clearPluginClientAuthState(client);
+}
+
+function disconnectPluginClient(client) {
+  detachPluginClient(client);
+  // Terminate instead of waiting for a peer-controlled closing handshake.
+  try { client.terminate(); } catch (_) {}
+}
+
+async function drainPluginActions(client, request, state, handleAction) {
+  if (state.running || pluginActiveActions >= MAX_PLUGIN_ACTIVE_ACTIONS) return;
+  state.running = true;
+  pluginActiveActions++;
+  try {
+    while (state.queue.length && ownsPluginClient(client, request)) {
+      const event = state.queue.shift();
+      pluginPendingActions--;
+      await handleAction(event);
+    }
+  } catch (_) {
+    // EventEmitter does not consume rejected async-listener promises.
+    disconnectPluginClient(client);
+  } finally {
+    state.running = false;
+    pluginActiveActions--;
+  }
+}
 
 function clearPluginClientAuthState(client) {
   if (!client) return;
+  const cancel = pluginClientAuthCancellations.get(client);
+  if (cancel) cancel();
+  pluginClientAuthCancellations.delete(client);
+  pluginClientAuthRefreshes.delete(client);
+  pluginClientBroadcasts.delete(client);
   delete client.__pushoverWatchdogOriginAllowed;
   delete client.__pushoverWatchdogRequest;
   delete client.__pushoverWatchdogSession;
@@ -1580,6 +1672,7 @@ function refreshAdminAuthenticatedWs(client) {
     const finish = (err) => {
       if (settled) return;
       settled = true;
+      pluginClientAuthCancellations.delete(client);
       runtimeClearTimer(timeoutTimer);
       timeoutTimer = null;
       if (stopCleanup) runtime.cleanups.delete(stopCleanup);
@@ -1590,6 +1683,7 @@ function refreshAdminAuthenticatedWs(client) {
       resolve(isAdminAuthenticatedWs(client));
     };
 
+    pluginClientAuthCancellations.set(client, () => finish(new Error('Plugin client disconnected.')));
     stopCleanup = runtimeAddCleanup(() => finish(new Error('Plugin runtime stopped.')));
     timeoutTimer = runtimeSetTimeout(
       () => finish(new Error('Administrator session refresh timed out.')),
@@ -1614,6 +1708,8 @@ function detachPluginClientMessageHandlers() {
   for (const [client, handlers] of pluginClientMessageHandlers.entries()) {
     try { client.off('message', handlers.message); } catch (_) {}
     try { client.off('close', handlers.close); } catch (_) {}
+    pluginPendingActions -= handlers.state.queue.length;
+    handlers.state.queue.length = 0;
     clearPluginClientAuthState(client);
   }
   pluginClientMessageHandlers.clear();
@@ -1629,12 +1725,18 @@ function registerPluginWebSocketAuthHandlers() {
   }
 
   const connectionHandler = (client, request) => {
+    // Decline plugin attachment under aggregate pressure without disrupting
+    // other plugins on the shared transport or allocating per-client state.
+    if (pluginClientMessageHandlers.size >= MAX_PLUGIN_CLIENTS ||
+        !takePluginBudget(pluginConnectionBudget, 1, 0)) return;
     const originAllowed = isAllowedWebSocketOrigin(request);
     client.__pushoverWatchdogOriginAllowed = originAllowed;
     client.__pushoverWatchdogRequest = request || null;
     client.__pushoverWatchdogSession = request?.session || null;
-    if (!originAllowed) logWarn(`[${PLUGIN_NAME}] Rejected plugin WebSocket actions due to invalid Origin header.`);
-    else if (request?.session?.isAdminAuthenticated === true) ensurePluginClientChannel(client);
+    const state = {
+      queue: [], running: false, lastRejectionAt: -Infinity,
+      budget: createPluginBudget(200, 2 * 1024 * 1024, 2)
+    };
 
     const requireAdmin = async (action) => {
       if (await refreshAdminAuthenticatedWs(client)) {
@@ -1646,17 +1748,7 @@ function registerPluginWebSocketAuthHandlers() {
       return false;
     };
 
-    const messageHandler = async (message) => {
-      if (!ownsPluginClient(client, request)) return;
-      if (Buffer.byteLength(message) > MAX_PLUGIN_MESSAGE_BYTES) {
-        logWarn(`[${PLUGIN_NAME}] Ignored oversized plugin WebSocket message.`);
-        return;
-      }
-      let event;
-      try { event = JSON.parse(message.toString()); } catch (_) { return; }
-      if (!event || typeof event !== 'object' || typeof event.type !== 'string') return;
-      if (!event.type.startsWith('PushoverWatchdog:')) return;
-
+    const handleAction = async (event) => {
       if (event.type === 'PushoverWatchdog:getConfig') {
         if (!(await requireAdmin('view Pushover Watchdog settings'))) return;
         sendPluginMessageTo(client, 'PushoverWatchdog:config', sanitizedConfigForUi());
@@ -1685,18 +1777,51 @@ function registerPluginWebSocketAuthHandlers() {
       if (event.type === 'PushoverWatchdog:test' || event.type === 'PushoverWatchdog:testChannel') {
         if (!(await requireAdmin('send FM Monitor test notifications'))) return;
         const channel = event.type === 'PushoverWatchdog:test' ? 'pushover' : String(event.value?.channel || '').toLowerCase();
-        sendTestNotification(channel)
+        await sendTestNotification(channel)
           .then(() => sendPluginMessageTo(client, 'PushoverWatchdog:toast', { level: 'success', message: `${channelLabel(channel)} test notification sent.` }))
           .catch(err => sendPluginMessageTo(client, 'PushoverWatchdog:toast', { level: 'error', message: `${channelLabel(channel)} test failed: ${err.message}` }));
       }
     };
+    const messageHandler = (message) => {
+      if (!ownsPluginClient(client, request)) return;
+      const bytes = Buffer.byteLength(message);
+      if (!takePluginBudget(state.budget, 1, bytes)) {
+        // Before dispatch this might belong to another plugin. Stop our work
+        // without terminating the host's shared connection or other listeners.
+        detachPluginClient(client);
+        return;
+      }
+      if (!takePluginBudget(pluginFrameBudget, 1, bytes)) return;
+      // Preserve the existing per-frame ignore policy on the shared transport;
+      // repeated oversized frames still exhaust the byte/count budget above.
+      if (bytes > MAX_PLUGIN_MESSAGE_BYTES) return;
+      let event;
+      try { event = JSON.parse(message.toString()); } catch (_) { return; }
+      if (!event || !PLUGIN_ACTION_TYPES.has(event.type)) return;
+      if (state.queue.length >= MAX_PLUGIN_PENDING_ACTIONS) {
+        disconnectPluginClient(client);
+        return;
+      }
+      // Do not retain work when all execution slots are occupied. Existing
+      // per-client queues are drained by their one active worker.
+      if ((!state.running && pluginActiveActions >= MAX_PLUGIN_ACTIVE_ACTIONS) ||
+          pluginPendingActions >= MAX_PLUGIN_TOTAL_PENDING_ACTIONS ||
+          !takePluginBudget(pluginActionBudget, 1, 0)) return;
+      state.queue.push(event);
+      pluginPendingActions++;
+      void drainPluginActions(client, request, state, handleAction);
+    };
     const closeHandler = () => {
+      client.off('message', messageHandler);
       pluginClientMessageHandlers.delete(client);
+      pluginPendingActions -= state.queue.length;
+      state.queue.length = 0;
       clearPluginClientAuthState(client);
     };
-    pluginClientMessageHandlers.set(client, { message: messageHandler, close: closeHandler });
+    pluginClientMessageHandlers.set(client, { message: messageHandler, close: closeHandler, state });
     client.on('message', messageHandler);
     client.once('close', closeHandler);
+    if (originAllowed && request?.session?.isAdminAuthenticated === true) ensurePluginClientChannel(client);
   };
 
   wss.on('connection', connectionHandler);
