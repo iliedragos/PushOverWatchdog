@@ -1,6 +1,6 @@
 # Changelog
 
-## v1.0.7 - 2026-11-11
+## v1.0.7 - 2026-11-10
 
 - Limited administrator frontend traffic before JSON parsing and dashboard authentication checks: 200-frame and 2 MiB UTF-16 text-storage bursts, replenished over two seconds.
 - Close only the plugin-owned browser socket on excess traffic and ignore queued messages from that connection. Retry with 5/10/20/40/60-second delays, capped at 60 seconds; reset after a configured connection has stayed open for a minute and closes without a flood.
