@@ -54,9 +54,16 @@
   }
 
   const pluginName = 'Pushover Watchdog';
-  const pluginVersion = '1.0.6';
+  const pluginVersion = '1.0.7';
   const pluginAuthor = 'by Play Radio Constanta';
   const maxPluginMessageBytes = 65536;
+  // Bound aggregate work before parsing or inspecting the dashboard DOM.
+  const maxInboundFrames = 200;
+  const maxInboundTextBytes = 2 * 1024 * 1024;
+  const inboundRefillMs = 2000;
+  const baseReconnectDelayMs = 5000;
+  const maxReconnectDelayMs = 60000;
+  const stableConnectionMs = 60000;
   const maxRtLogPageSize = 250;
   const adminSessionCheckMs = 5000;
   let config = null;
@@ -64,6 +71,7 @@
   let ws = null;
   let wsReconnectTimer = null;
   let wsConfigTimer = null;
+  let wsReconnectDelayMs = baseReconnectDelayMs;
   let channelToken = null;
   let rtLogEntries = [];
   let rtLogHasMore = false;
@@ -88,14 +96,18 @@
   function connect() {
     if (runtime.stopped || !isAdminAuthenticated()) return;
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-    if (wsReconnectTimer) {
-      runtimeClearTimer(wsReconnectTimer);
-      wsReconnectTimer = null;
-    }
+    if (wsReconnectTimer) return;
     const socket = new WebSocket(wsUrl());
+    let frames = maxInboundFrames;
+    let textBytes = maxInboundTextBytes;
+    let lastAdmissionAt = performance.now();
+    let openedAt = lastAdmissionAt;
+    let flooded = false;
+    let receivedConfig = false;
     ws = socket;
     socket.addEventListener('open', () => {
       if (runtime.stopped || ws !== socket || !isAdminAuthenticated()) return;
+      openedAt = performance.now();
       // Admission may be declined temporarily under backend pressure. Retry
       // this plugin-owned connection if its initial config never arrives.
       runtimeClearTimer(wsConfigTimer);
@@ -106,8 +118,24 @@
       send('PushoverWatchdog:getConfig', {});
     });
     socket.addEventListener('message', (event) => {
-      if (runtime.stopped || ws !== socket || !isAdminAuthenticated()) return;
+      if (runtime.stopped || ws !== socket || flooded) return;
+      const now = performance.now();
+      const elapsed = Math.max(0, now - lastAdmissionAt);
+      lastAdmissionAt = now;
+      frames = Math.min(maxInboundFrames, frames + elapsed * maxInboundFrames / inboundRefillMs);
+      textBytes = Math.min(maxInboundTextBytes, textBytes + elapsed * maxInboundTextBytes / inboundRefillMs);
+      // Charge UTF-16 storage conservatively without allocating an encoded copy.
+      // Oversized/non-text messages also consume frame admission.
+      const size = typeof event.data === 'string' ? event.data.length * 2 : 0;
+      if (frames < 1 || textBytes < size) {
+        flooded = true;
+        socket.close();
+        return;
+      }
+      frames--;
+      textBytes -= size;
       if (typeof event.data !== 'string' || event.data.length > maxPluginMessageBytes) return;
+      if (!isAdminAuthenticated()) return;
       let msg;
       try { msg = JSON.parse(event.data); } catch (_) { return; }
       if (!isPlainObject(msg) || typeof msg.type !== 'string') return;
@@ -127,6 +155,7 @@
         runtimeClearTimer(wsConfigTimer);
         wsConfigTimer = null;
         config = msg.value;
+        receivedConfig = true;
         renderModal();
       }
       if (msg.type === 'PushoverWatchdog:status') {
@@ -154,11 +183,16 @@
       ws = null;
       channelToken = null;
       if (runtime.stopped || !isAdminAuthenticated()) return;
+      if (!flooded && receivedConfig && performance.now() - openedAt >= stableConnectionMs) {
+        wsReconnectDelayMs = baseReconnectDelayMs;
+      }
+      const reconnectDelay = wsReconnectDelayMs;
+      if (flooded) wsReconnectDelayMs = Math.min(maxReconnectDelayMs, wsReconnectDelayMs * 2);
       if (!wsReconnectTimer) {
         wsReconnectTimer = runtimeSetTimeout(() => {
           wsReconnectTimer = null;
           connect();
-        }, 5000);
+        }, reconnectDelay);
       }
     });
   }
