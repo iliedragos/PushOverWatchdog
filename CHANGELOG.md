@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.7 - 2026-11-10
+
+- Limited administrator frontend traffic before JSON parsing and dashboard authentication checks: 200-frame and 2 MiB UTF-16 text-storage bursts, replenished over two seconds.
+- Close only the plugin-owned browser socket on excess traffic and ignore queued messages from that connection. Retry with 5/10/20/40/60-second delays, capped at 60 seconds; reset after a configured connection has stayed open for a minute and closes without a flood.
+- Added frontend regressions for wrong-token, malformed, oversized and binary floods, aggregate text volume, recovery, logout, and legitimate config/status/RadioText traffic.
+
 ## v1.0.6 - 2026-11-10
 
 - Removed provider-controlled HTTP error response bodies from Pushover/Telegram diagnostics to prevent reflected credentials from reaching logs or administrator test notifications; channel and HTTP status remain available. Added regression coverage for both providers, oversized responses and successful delivery.
